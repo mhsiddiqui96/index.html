@@ -43,11 +43,12 @@ npm start                   # http://localhost:3000
 
 WhatsApp কানেক্ট করার আগেই ইনবক্স ট্রাই করে দেখতে চাইলে **সেটিংস → 🧪 টেস্ট মেসেজ** ব্যবহার করুন।
 
-Docker দিয়ে চালাতে চাইলে:
+### সার্ভারে চালু করা (প্রোডাকশন)
+
+VPS-এ এক কমান্ডে ইনস্টল করা যায়। এতে Docker সেটআপ আর অটোমেটিক HTTPS নিজে থেকেই হয়ে যায়। অথবা Render.com ব্যবহার করা যায়। ধাপে ধাপে নিয়ম আছে **[DEPLOY.md](DEPLOY.md)** ফাইলে।
 
 ```bash
-docker build -t wa-desk .
-docker run -p 3000:3000 --env-file .env -v wa-data:/app/data wa-desk
+curl -fsSL https://raw.githubusercontent.com/mhsiddiqui96/index.html/claude/whatsapp-business-saas-rhanlc/whatsapp-saas/deploy/install.sh | sudo bash
 ```
 
 ## WhatsApp কানেক্ট করা (Meta Cloud API)
@@ -99,4 +100,6 @@ src/webhook.js     Meta webhook (যাচাই + ইনকামিং মে�
 src/api.js         REST API (টিম, সেটিংস, ইনবক্স, টেমপ্লেট, কুইক রিপ্লাই, স্ট্যাটস)
 public/            বাংলা অ্যাডমিন প্যানেল (vanilla JS, কোনো build step নেই)
 test/              API টেস্ট (npm test)
+deploy/            VPS ইনস্টলার, ব্যাকআপ স্ক্রিপ্ট, Docker entrypoint
+docker-compose.yml অ্যাপ + Caddy (HTTPS)
 ```

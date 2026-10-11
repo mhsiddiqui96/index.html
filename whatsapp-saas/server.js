@@ -14,6 +14,7 @@ if (fs.existsSync(envFile)) {
 const express = require('express');
 const api = require('./src/api');
 const { router: webhook } = require('./src/webhook');
+const { db, get } = require('./src/db');
 
 function createApp() {
   const app = express();
@@ -29,6 +30,10 @@ function createApp() {
     res.setHeader('Referrer-Policy', 'same-origin');
     next();
   });
+  app.get('/healthz', (req, res) => {
+    get('SELECT 1');
+    res.json({ ok: true });
+  });
   app.use('/webhook', webhook);
   app.use('/api', api);
   app.use(express.static(path.join(__dirname, 'public')));
@@ -38,11 +43,19 @@ function createApp() {
 
 if (require.main === module) {
   const port = Number(process.env.PORT) || 3000;
-  createApp().listen(port, () => {
+  const server = createApp().listen(port, () => {
     console.log(`WhatsApp Business SaaS চালু হয়েছে: http://localhost:${port}`);
     if (!process.env.WEBHOOK_VERIFY_TOKEN) console.warn('WEBHOOK_VERIFY_TOKEN সেট করা নেই — Meta webhook যাচাই কাজ করবে না।');
     if (!process.env.META_APP_SECRET) console.warn('META_APP_SECRET সেট করা নেই — webhook সিগনেচার যাচাই বন্ধ আছে।');
   });
+  // Docker/Render send SIGTERM on redeploy: finish in-flight requests, close the DB cleanly.
+  const shutdown = () => {
+    server.close(() => { db.close(); process.exit(0); });
+    server.closeAllConnections?.(); // SSE streams would otherwise keep the server open
+    setTimeout(() => process.exit(0), 5000).unref();
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 }
 
 module.exports = { createApp };

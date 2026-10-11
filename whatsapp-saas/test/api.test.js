@@ -184,3 +184,9 @@ test('workspaces are isolated', async () => {
   assert.equal((await other('PATCH', `/api/users/${agentId}`, { active: true })).status, 404);
   assert.equal((await other('PUT', '/api/settings', { wa_phone_number_id: '111222' })).status, 400);
 });
+
+test('health check endpoint', async () => {
+  const r = await client()('GET', '/healthz');
+  assert.equal(r.status, 200);
+  assert.equal(r.data.ok, true);
+});
