@@ -48,7 +48,7 @@ ssh root@আপনার-সার্ভার-IP
 তারপর এই কমান্ডটা পেস্ট করে Enter চাপুন:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mhsiddiqui96/index.html/claude/whatsapp-business-saas-rhanlc/whatsapp-saas/deploy/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/mhsiddiqui96/index.html/main/whatsapp-saas/deploy/install.sh | sudo bash
 ```
 
 স্ক্রিপ্টটা আপনার কাছে তিনটা জিনিস জানতে চাইবে:
@@ -86,7 +86,6 @@ curl -fsSL https://raw.githubusercontent.com/mhsiddiqui96/index.html/claude/what
 
 1. [render.com](https://render.com)-এ GitHub দিয়ে সাইন-আপ করুন।
 2. **New → Blueprint** চাপুন। `mhsiddiqui96/index.html` রিপোটা কানেক্ট করুন।
-   - কোড যদি এখনো `main` branch-এ মার্জ না করা থাকে, তাহলে branch হিসেবে `claude/whatsapp-business-saas-rhanlc` বাছাই করুন।
 3. Render নিজেই `render.yaml` ফাইলটা পড়ে নেবে। শুধু `META_APP_SECRET`-এর মান চাইবে। এখন না থাকলে খালি রাখুন।
 4. **Apply** চাপুন। কয়েক মিনিট পর `https://wa-business-desk-xxxx.onrender.com` ধরনের একটা লিংক পাবেন।
 5. Webhook-এর **Verify Token** দেখতে যান **Dashboard → wa-business-desk → Environment**-এ। সেখানে `WEBHOOK_VERIFY_TOKEN`-এর মান দেখা যাবে।

@@ -48,7 +48,7 @@ WhatsApp কানেক্ট করার আগেই ইনবক্স ট�
 VPS-এ এক কমান্ডে ইনস্টল করা যায়। এতে Docker সেটআপ আর অটোমেটিক HTTPS নিজে থেকেই হয়ে যায়। অথবা Render.com ব্যবহার করা যায়। ধাপে ধাপে নিয়ম আছে **[DEPLOY.md](DEPLOY.md)** ফাইলে।
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mhsiddiqui96/index.html/claude/whatsapp-business-saas-rhanlc/whatsapp-saas/deploy/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/mhsiddiqui96/index.html/main/whatsapp-saas/deploy/install.sh | sudo bash
 ```
 
 ## WhatsApp কানেক্ট করা (Meta Cloud API)

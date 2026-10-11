@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # WA Business Desk — Ubuntu/Debian VPS এ এক কমান্ডে ইনস্টল/আপডেট
 #
-#   curl -fsSL https://raw.githubusercontent.com/mhsiddiqui96/index.html/claude/whatsapp-business-saas-rhanlc/whatsapp-saas/deploy/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/mhsiddiqui96/index.html/main/whatsapp-saas/deploy/install.sh | sudo bash
 #
 # আবার চালালে কোড আপডেট হয়ে অ্যাপ নতুন করে চালু হবে; ডাটা ও .env অক্ষত থাকবে।
 set -euo pipefail
 
 REPO="${REPO:-https://github.com/mhsiddiqui96/index.html.git}"
-BRANCH="${BRANCH:-claude/whatsapp-business-saas-rhanlc}"
+BRANCH="${BRANCH:-main}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/wa-desk}"
 APP_DIR="$INSTALL_DIR/whatsapp-saas"
 
