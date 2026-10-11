@@ -1,0 +1,7 @@
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy app:3000 {
+		# keep live inbox (Server-Sent Events) streaming without buffering
+		flush_interval -1
+	}
+}

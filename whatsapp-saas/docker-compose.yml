@@ -1,0 +1,35 @@
+# VPS-এ চালানোর জন্য: অ্যাপ + Caddy (অটোমেটিক ফ্রি HTTPS সার্টিফিকেট)
+# চালু করতে: docker compose up -d --build   (.env ফাইলে DOMAIN সহ সব মান দিন)
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /app/data
+      COOKIE_SECURE: "true"
+    volumes:
+      - app-data:/app/data
+    expose:
+      - "3000"
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN must be set in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  app-data:
+  caddy-data:
+  caddy-config:
