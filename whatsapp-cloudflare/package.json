@@ -1,0 +1,21 @@
+{
+  "name": "wa-business-desk",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Multi-admin WhatsApp Business inbox on Cloudflare Workers + D1 (free tier), using the official WhatsApp Cloud API",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.40.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "DB": {
+        "description": "অ্যাপের সব ডাটা (টিম, চ্যাট, মেসেজ) এই ফ্রি ডাটাবেসে থাকবে। নাম যেমন আছে তেমন রাখুন।"
+      }
+    }
+  }
+}

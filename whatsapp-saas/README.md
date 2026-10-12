@@ -1,5 +1,7 @@
 # WA Business Desk — WhatsApp Business SaaS
 
+> **সার্ভার ছাড়া, ক্লিক করেই ফ্রিতে চালাতে চান?** [`whatsapp-cloudflare/`](../whatsapp-cloudflare/README.md) ভার্সনটি ব্যবহার করুন — এক ক্লিকে Cloudflare-এ চালু হয়।
+
 WhatsApp Business-কে একটা ওয়েব অ্যাপ বা SaaS-এ নিয়ে আসার সিস্টেম। এখানে **মালিক** বা **অ্যাডমিন** টিমে সদস্য যোগ করতে পারবেন। তারপর সবাই একসাথে একটা WhatsApp নাম্বার থেকে গ্রাহকদের সাথে চ্যাট করতে পারবেন।
 
 এটা Meta-র অফিসিয়াল **WhatsApp Business Cloud API** দিয়ে চলে। তাই নাম্বার ব্যান হওয়ার ঝুঁকি নেই, যেটা আনঅফিসিয়াল WhatsApp Web স্ক্র্যাপিং টুলে থাকে।
