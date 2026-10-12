@@ -1,0 +1,26 @@
+// Lets a Cloudflare Worker connected to this repo from the dashboard build with Root directory "/".
+// Mirrors whatsapp-cloudflare/wrangler.jsonc (used by the Deploy button) — keep the two in sync.
+{
+  "$schema": "https://unpkg.com/wrangler@4.149.0/config-schema.json",
+  "name": "wa-business-saas",
+  "main": "whatsapp-cloudflare/src/index.js",
+  "compatibility_date": "2025-09-01",
+  "assets": {
+    "directory": "./whatsapp-cloudflare/public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/webhook", "/webhook/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      // No database_id: Wrangler creates the D1 database on the first deploy and reuses it afterwards.
+      "database_name": "wa-business-saas-db"
+    }
+  ],
+  "vars": {
+    "ALLOW_SIGNUP": "false",
+    "GRAPH_API_VERSION": "v21.0"
+  },
+  "observability": { "enabled": true }
+}
