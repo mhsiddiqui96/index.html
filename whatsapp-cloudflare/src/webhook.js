@@ -1,6 +1,7 @@
 // Meta WhatsApp Cloud API webhook. One URL serves every workspace; messages are routed by phone_number_id.
 import { decrypt, verifyMetaSignature } from './crypto.js';
-import { storeInbound, updateStatus } from './inbox.js';
+import { storeInbound, updateStatus, conversationView } from './inbox.js';
+import { notifyInbound } from './push.js';
 
 export async function handleWebhook(request, env, ctx, db) {
   const url = new URL(request.url);
@@ -20,7 +21,7 @@ export async function handleWebhook(request, env, ctx, db) {
   try { payload = JSON.parse(raw); } catch { return new Response('Bad request', { status: 400 }); }
   const signature = request.headers.get('x-hub-signature-256');
   // Acknowledge immediately (Meta retries slow webhooks); process in the background.
-  ctx.waitUntil(processPayload(db, payload, raw, signature).catch((err) => console.error('webhook failed', err)));
+  ctx.waitUntil(processPayload(db, payload, raw, signature, url.origin).catch((err) => console.error('webhook failed', err)));
   return new Response('OK', { status: 200 });
 }
 
@@ -46,7 +47,7 @@ function extractBody(msg) {
   }
 }
 
-export async function processPayload(db, payload, raw, signature) {
+export async function processPayload(db, payload, raw, signature, origin) {
   const checked = new Map(); // workspace id -> signature ok
   for (const entry of payload.entry || []) {
     for (const change of entry.changes || []) {
@@ -64,10 +65,14 @@ export async function processPayload(db, payload, raw, signature) {
       const names = Object.fromEntries((value.contacts || []).map((c) => [c.wa_id, c.profile?.name]));
       for (const msg of value.messages || []) {
         const { body, mediaId } = extractBody(msg);
-        await storeInbound(db, ws.id, {
+        const stored = await storeInbound(db, ws.id, {
           waId: msg.from, name: names[msg.from], waMessageId: msg.id,
           type: msg.type, body, mediaId, timestampMs: Number(msg.timestamp) * 1000,
         });
+        if (stored) {
+          await notifyInbound(db, await conversationView(db, stored.convId), body || `[${msg.type}]`, origin)
+            .catch((err) => console.error('push failed', err));
+        }
       }
       for (const st of value.statuses || []) {
         const err = st.errors?.[0];

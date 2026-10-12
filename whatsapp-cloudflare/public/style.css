@@ -46,7 +46,7 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--green-light
   background: linear-gradient(160deg, var(--green-dark) 0 220px, var(--bg) 220px); }
 .auth-card { width: 100%; max-width: 420px; background: var(--panel); border-radius: 14px; padding: 28px; box-shadow: 0 10px 30px rgba(0,0,0,.12); }
 .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 20px; }
-.brand .logo { width: 36px; height: 36px; border-radius: 50%; background: var(--green-light); display: grid; place-items: center; color: #fff; }
+.brand .logo { width: 36px; height: 36px; border-radius: 9px; flex-shrink: 0; }
 .auth-card h1 { font-size: 20px; margin: 18px 0 2px; }
 .auth-card .switch { margin-top: 16px; font-size: 14px; color: var(--muted); text-align: center; }
 .auth-card .btn { width: 100%; margin-top: 18px; padding: 11px; }
@@ -161,3 +161,10 @@ ol.steps li { margin-bottom: 6px; }
   .bubble { max-width: 88%; }
   .hide-sm { display: none; }
 }
+
+/* App install / notifications */
+.app-tools { display: flex; flex-direction: column; gap: 6px; padding: 8px 4px 0; }
+.app-tools button { background: rgba(255,255,255,.14); color: #fff; border: 0; border-radius: 8px; padding: 8px 10px; cursor: pointer; text-align: left; font: inherit; font-size: 13.5px; }
+.app-tools button:hover { background: rgba(255,255,255,.22); }
+.push-banner { display: flex; align-items: center; justify-content: space-between; gap: 8px; background: var(--warn-bg); padding: 8px 12px; font-size: 13.5px; border-bottom: 1px solid var(--border); }
+@media (display-mode: standalone) { .mobile-top { padding-top: max(10px, env(safe-area-inset-top)); } }

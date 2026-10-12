@@ -87,6 +87,15 @@ const SCHEMA = [
     created_ms INTEGER NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_activity_ws ON activity(workspace_id, id DESC)`,
+  `CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    endpoint TEXT NOT NULL UNIQUE,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    created_ms INTEGER NOT NULL
+  )`,
 ];
 
 let ready = null;

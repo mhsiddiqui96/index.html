@@ -9,13 +9,22 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 const graphCalls = [];
+const pushCalls = [];
 let graph, worker, base, stateDir;
 
 before(async () => {
   graph = http.createServer((req, res) => {
     let raw = '';
-    req.on('data', (c) => (raw += c));
+    const chunks = [];
+    let rawBuf;
+    req.on('data', (c) => { chunks.push(c); raw += c; });
+    req.on('end', () => { rawBuf = Buffer.concat(chunks); });
     req.on('end', () => {
+      if (req.url.startsWith('/push/')) {
+        pushCalls.push({ url: req.url, headers: req.headers, body: Buffer.from(rawBuf) });
+        res.statusCode = req.url.includes('gone') ? 410 : 201;
+        return res.end();
+      }
       graphCalls.push({ url: req.url, body: raw ? JSON.parse(raw) : null });
       res.setHeader('Content-Type', 'application/json');
       if (req.url.includes('/messages')) return res.end(JSON.stringify({ messages: [{ id: `wamid.out${graphCalls.length}` }] }));
@@ -30,7 +39,7 @@ before(async () => {
   const port = 8800 + Math.floor(Math.random() * 100);
   base = `http://127.0.0.1:${port}`;
   worker = spawn('node_modules/.bin/wrangler', ['dev', '--port', String(port), '--ip', '127.0.0.1', '--persist-to', stateDir,
-    '--var', `GRAPH_BASE_URL:http://127.0.0.1:${graph.address().port}`], {
+    '--var', `GRAPH_BASE_URL:http://127.0.0.1:${graph.address().port}`, '--var', 'ALLOW_HTTP_PUSH:true'], {
     env: { ...process.env, NO_PROXY: '127.0.0.1,localhost', no_proxy: '127.0.0.1,localhost', WRANGLER_SEND_METRICS: 'false', CI: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,
@@ -211,6 +220,82 @@ test('simulated message, quick replies, stats, activity', async () => {
   assert.equal(s.contacts, 3);
   assert.ok(s.inbound_today >= 2);
   assert.ok((await owner('GET', '/api/activity')).data.some((a) => a.action === 'user.added'));
+});
+
+// --- Web Push: a fake browser subscription whose payloads we decrypt per RFC 8291 ---
+function fakeDevice(name) {
+  const ecdh = crypto.createECDH('prime256v1');
+  ecdh.generateKeys();
+  const auth = crypto.randomBytes(16);
+  return {
+    ecdh, auth,
+    sub: { endpoint: `http://127.0.0.1:${graph.address().port}/push/${name}`, keys: { p256dh: ecdh.getPublicKey().toString('base64url'), auth: auth.toString('base64url') } },
+  };
+}
+const hmac = (key, data) => crypto.createHmac('sha256', key).update(data).digest();
+function decryptPush(device, body) {
+  const salt = body.subarray(0, 16);
+  const idlen = body[20];
+  const asPublic = body.subarray(21, 21 + idlen);
+  const ct = body.subarray(21 + idlen);
+  const shared = device.ecdh.computeSecret(asPublic);
+  const ikm = hmac(hmac(device.auth, shared), Buffer.concat([Buffer.from('WebPush: info\0'), device.ecdh.getPublicKey(), asPublic, Buffer.from([1])]));
+  const prk = hmac(salt, ikm);
+  const cek = hmac(prk, Buffer.concat([Buffer.from('Content-Encoding: aes128gcm\0'), Buffer.from([1])])).subarray(0, 16);
+  const nonce = hmac(prk, Buffer.concat([Buffer.from('Content-Encoding: nonce\0'), Buffer.from([1])])).subarray(0, 12);
+  const d = crypto.createDecipheriv('aes-128-gcm', cek, nonce);
+  d.setAuthTag(ct.subarray(ct.length - 16));
+  const plain = Buffer.concat([d.update(ct.subarray(0, ct.length - 16)), d.final()]);
+  assert.equal(plain[plain.length - 1], 2);
+  return JSON.parse(plain.subarray(0, plain.length - 1).toString());
+}
+const pushesTo = (name) => pushCalls.filter((c) => c.url === `/push/${name}`);
+
+test('push: VAPID-signed, encrypted notifications reach every allowed team member', async () => {
+  const { publicKey } = (await owner('GET', '/api/push/key')).data;
+  assert.equal(Buffer.from(publicKey, 'base64url').length, 65);
+  const devices = { owner: fakeDevice('owner'), admin: fakeDevice('admin'), agent: fakeDevice('agent'), gone: fakeDevice('gone') };
+  assert.equal((await owner('POST', '/api/push/subscribe', devices.owner.sub)).status, 201);
+  assert.equal((await admin('POST', '/api/push/subscribe', devices.admin.sub)).status, 201);
+  assert.equal((await agent('POST', '/api/push/subscribe', devices.agent.sub)).status, 201);
+  assert.equal((await owner('POST', '/api/push/subscribe', devices.gone.sub)).status, 201);
+  assert.equal((await owner('POST', '/api/push/subscribe', { endpoint: 'ftp://x', keys: {} })).status, 400);
+
+  // New unassigned chat: owner, admin and agent are all notified.
+  await owner('POST', '/api/simulate-inbound', { phone: '8801999999999', name: 'নতুন লিড', text: 'ভর্তি হতে চাই' });
+  await wait(1000);
+  for (const who of ['owner', 'admin', 'agent']) {
+    const calls = pushesTo(who);
+    assert.equal(calls.length, 1, `${who} should get one push`);
+    const payload = decryptPush(devices[who], calls[0].body);
+    assert.equal(payload.title, 'নতুন লিড');
+    assert.equal(payload.body, 'ভর্তি হতে চাই');
+    assert.match(payload.url, /^\/#\/inbox\/\d+$/);
+    // VAPID JWT is signed by the advertised key and addressed to the push service origin.
+    const [, jwt, k] = calls[0].headers.authorization.match(/^vapid t=([^,]+), k=(.+)$/);
+    assert.equal(k, publicKey);
+    const [h, c, sig] = jwt.split('.');
+    const pub = Buffer.from(publicKey, 'base64url');
+    const key = crypto.createPublicKey({ key: { kty: 'EC', crv: 'P-256', x: pub.subarray(1, 33).toString('base64url'), y: pub.subarray(33).toString('base64url') }, format: 'jwk' });
+    assert.ok(crypto.verify('sha256', Buffer.from(`${h}.${c}`), { key, dsaEncoding: 'ieee-p1363' }, Buffer.from(sig, 'base64url')));
+    assert.equal(JSON.parse(Buffer.from(c, 'base64url')).aud, `http://127.0.0.1:${graph.address().port}`);
+    assert.equal(calls[0].headers['content-encoding'], 'aes128gcm');
+  }
+  // The 410 Gone device was forgotten: no second attempt.
+  assert.equal(pushesTo('gone').length, 1);
+
+  // A chat assigned to the admin (via the real webhook): owner + admin notified, agent not.
+  await signedWebhook(inbound('wamid.in2', 'আবার মেসেজ'));
+  await wait(1000);
+  assert.equal(pushesTo('owner').length, 2);
+  assert.equal(pushesTo('admin').length, 2);
+  assert.equal(pushesTo('agent').length, 1);
+  assert.equal(pushesTo('gone').length, 1);
+
+  // Test button and unsubscribe.
+  assert.equal((await admin('POST', '/api/push/test', {})).data.devices, 1);
+  await admin('POST', '/api/push/unsubscribe', { endpoint: devices.admin.sub.endpoint });
+  assert.equal((await admin('POST', '/api/push/test', {})).status, 400);
 });
 
 test('deactivated user is logged out', async () => {

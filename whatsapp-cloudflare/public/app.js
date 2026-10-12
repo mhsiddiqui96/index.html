@@ -76,7 +76,7 @@ async function renderAuth(mode) {
   const signup = mode === 'signup';
   $('#app').innerHTML = `
   <div class="auth"><div class="auth-card">
-    <div class="brand"><div class="logo">✆</div> WA Business SaaS</div>
+    <div class="brand"><img class="logo" src="/icons/icon-192.png" alt=""> WA Business SaaS</div>
     <h1>${signup ? 'নতুন বিজনেস অ্যাকাউন্ট খুলুন' : 'লগইন করুন'}</h1>
     <div class="hint">${signup ? 'আপনি হবেন এই অ্যাকাউন্টের মালিক (Owner)। পরে টিমে অ্যাডমিন/এজেন্ট যোগ করতে পারবেন।' : 'আপনার টিমের WhatsApp ইনবক্সে প্রবেশ করুন'}</div>
     <form id="authForm">
@@ -123,10 +123,11 @@ function renderShell() {
   <div class="shell">
     <div class="mobile-top"><button id="menuBtn" aria-label="মেনু">☰</button><b>${esc(state.workspace.name)}</b></div>
     <aside class="side" id="side">
-      <div class="brand"><div class="logo">✆</div><span>${esc(state.workspace.name)}</span></div>
+      <div class="brand"><img class="logo" src="/icons/icon-192.png" alt=""><span>${esc(state.workspace.name)}</span></div>
       <nav>${NAV.filter((n) => !n.manager || isManager()).map((n) =>
         `<a href="#/${n.id}" data-nav="${n.id}">${n.icon} ${n.label}${n.id === 'inbox' ? '<span class="badge" id="unreadBadge" hidden></span>' : ''}</a>`).join('')}
       </nav>
+      <div class="app-tools" id="appTools"></div>
       <div class="me">
         <div>${esc(state.me.name)}</div>
         <div class="role">${ROLE_BN[state.me.role]}</div>
@@ -135,7 +136,12 @@ function renderShell() {
     </aside>
     <main class="main" id="main"></main>
   </div>`;
-  $('#logoutBtn').onclick = async () => { await api('/logout', { method: 'POST', body: {} }); state.me = null; renderAuth('login'); };
+  $('#logoutBtn').onclick = async () => {
+    await disablePush().catch(() => {}); // a logged-out device must not keep getting this team's messages
+    await api('/logout', { method: 'POST', body: {} });
+    state.me = null;
+    renderAuth('login');
+  };
   $('#menuBtn').onclick = () => $('#side').classList.toggle('open');
   $('#side').addEventListener('click', (e) => { if (e.target.closest('a')) $('#side').classList.remove('open'); });
 }
@@ -154,6 +160,7 @@ function updateUnreadBadge() {
   const b = $('#unreadBadge');
   if (b) { b.hidden = !total; b.textContent = total; }
   document.title = (total ? `(${total}) ` : '') + 'WA Business SaaS';
+  if (navigator.setAppBadge) (total ? navigator.setAppBadge(total) : navigator.clearAppBadge()).catch(() => {});
 }
 
 // ---------- live updates (polling; Workers have no shared push channel on the free plan) ----------
@@ -253,6 +260,7 @@ async function pageInbox(convId) {
           </select>
         </div>
       </div>
+      <div id="pushBanner"></div>
       <div class="convs" id="convs"></div>
     </section>
     <section class="chat" id="chat"></section>
@@ -262,6 +270,7 @@ async function pageInbox(convId) {
   $$('[data-filter]').forEach((b) => (b.onclick = () => { state.filter = b.dataset.filter; pageInbox(state.current?.id); }));
   $('#statusSel').onchange = (e) => { state.status = e.target.value; loadConvs(); };
   $('#newChat').onclick = newChatModal;
+  renderAppTools();
   if (!state.users.length) state.users = await api('/users').catch(() => []);
   await loadConvs();
   if (convId) openConv(Number(convId)); else renderChat();
@@ -759,9 +768,10 @@ async function pageActivity() {
 }
 
 // ---------- account ----------
-function pageAccount() {
+async function pageAccount() {
   $('#main').innerHTML = `<div class="page"><h2>🔑 আমার অ্যাকাউন্ট</h2>
     <div class="card"><b>${esc(state.me.name)}</b> · ${esc(state.me.email)} · <span class="pill ${state.me.role}">${ROLE_BN[state.me.role]}</span></div>
+    ${await notificationCard()}
     <div class="card" style="max-width:420px"><h3>পাসওয়ার্ড পরিবর্তন</h3>
       <form id="pForm"><label>বর্তমান পাসওয়ার্ড</label><input name="currentPassword" type="password" required autocomplete="current-password">
       <label>নতুন পাসওয়ার্ড</label><input name="newPassword" type="password" required minlength="8" autocomplete="new-password">
@@ -770,6 +780,157 @@ function pageAccount() {
     e.preventDefault();
     try { await api('/me/password', { method: 'POST', body: formData(e.target) }); e.target.reset(); toast('পাসওয়ার্ড পরিবর্তন হয়েছে'); } catch (err) { toast(err.message, true); }
   };
+  const refresh = () => { renderAppTools(); if (location.hash === '#/account') pageAccount(); };
+  $('#pushOn')?.addEventListener('click', async () => { if (await enablePush()) refresh(); });
+  $('#pushOff')?.addEventListener('click', async () => { await disablePush(); toast('নোটিফিকেশন বন্ধ করা হয়েছে'); refresh(); });
+  $('#pushTest')?.addEventListener('click', async () => {
+    try { await api('/push/test', { method: 'POST', body: {} }); toast('টেস্ট নোটিফিকেশন পাঠানো হয়েছে — কয়েক সেকেন্ডের মধ্যে আসার কথা'); } catch (err) { toast(err.message, true); }
+  });
+  $('#installBtn2')?.addEventListener('click', installApp);
+}
+
+// ---------- installable app (PWA) & push notifications ----------
+const pwa = {
+  installEvent: null,
+  isIOS: /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1),
+  standalone: window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true,
+  pushSupported: 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window,
+};
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(() => {});
+  // A tapped notification asks an open window to show that chat.
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    if (e.data?.type === 'open' && e.data.url) {
+      const hash = new URL(e.data.url).hash;
+      if (hash && location.hash !== hash) location.hash = hash;
+    }
+  });
+}
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  pwa.installEvent = e;
+  renderAppTools();
+});
+window.addEventListener('appinstalled', () => { pwa.installEvent = null; pwa.standalone = true; renderAppTools(); toast('অ্যাপ ইনস্টল হয়েছে 🎉'); });
+
+function b64uToBytes(s) {
+  const b = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4));
+  return Uint8Array.from(b, (c) => c.charCodeAt(0));
+}
+
+async function currentSubscription() {
+  if (!pwa.pushSupported) return null;
+  const reg = await navigator.serviceWorker.ready;
+  return reg.pushManager.getSubscription();
+}
+
+const pushEnabled = async () => pwa.pushSupported && Notification.permission === 'granted' && !!(await currentSubscription().catch(() => null));
+
+async function enablePush() {
+  if (!pwa.pushSupported) {
+    toast(pwa.isIOS && !pwa.standalone ? 'iPhone-এ আগে অ্যাপটি হোম স্ক্রিনে যোগ করুন, তারপর সেখান থেকে খুলে নোটিফিকেশন চালু করুন।' : 'এই ব্রাউজারে নোটিফিকেশন সাপোর্ট নেই', true);
+    return false;
+  }
+  const permission = await Notification.requestPermission();
+  if (permission !== 'granted') {
+    toast('নোটিফিকেশনের অনুমতি দেওয়া হয়নি। ব্রাউজার/ফোনের সেটিংস থেকে অনুমতি দিন।', true);
+    return false;
+  }
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const { publicKey } = await api('/push/key');
+    let sub = await reg.pushManager.getSubscription();
+    const key = b64uToBytes(publicKey);
+    const sameKey = (s) => { const k = s?.options?.applicationServerKey; return !k || new Uint8Array(k).every((v, i) => v === key[i]); };
+    if (sub && !sameKey(sub)) { await sub.unsubscribe(); sub = null; }
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+    await api('/push/subscribe', { method: 'POST', body: sub.toJSON() });
+    toast('🔔 নোটিফিকেশন চালু হয়েছে');
+    return true;
+  } catch (err) {
+    toast('নোটিফিকেশন চালু করা যায়নি: ' + err.message, true);
+    return false;
+  }
+}
+
+async function disablePush() {
+  const sub = await currentSubscription().catch(() => null);
+  if (sub) {
+    await api('/push/unsubscribe', { method: 'POST', body: { endpoint: sub.endpoint } }).catch(() => {});
+    await sub.unsubscribe().catch(() => {});
+  }
+}
+
+// Keep the server's record of this device pointing at whoever is logged in now.
+async function syncPush() {
+  if (!pwa.pushSupported || Notification.permission !== 'granted') return;
+  const sub = await currentSubscription().catch(() => null);
+  if (sub) await api('/push/subscribe', { method: 'POST', body: sub.toJSON() }).catch(() => {});
+}
+
+async function installApp() {
+  if (pwa.installEvent) {
+    pwa.installEvent.prompt();
+    await pwa.installEvent.userChoice.catch(() => null);
+    pwa.installEvent = null;
+    renderAppTools();
+  } else {
+    modal(`<h3>📲 অ্যাপ হিসেবে ইনস্টল করুন</h3>
+      ${pwa.isIOS ? `<ol class="steps hint">
+        <li>Safari-তে এই পেজটি খুলুন।</li>
+        <li>নিচের <b>Share</b> বাটন (⬆️ চিহ্ন) চাপুন।</li>
+        <li><b>Add to Home Screen</b> চাপুন → <b>Add</b>।</li>
+        <li>হোম স্ক্রিনের নতুন আইকন থেকে অ্যাপটি খুলুন, তারপর নোটিফিকেশন চালু করুন।</li></ol>`
+      : `<ol class="steps hint">
+        <li>Chrome-এ উপরে ডানদিকের <b>⋮</b> মেনু চাপুন।</li>
+        <li><b>Install app</b> বা <b>Add to Home screen</b> চাপুন।</li></ol>`}
+      <div class="actions"><button class="btn" data-close>ঠিক আছে</button></div>`);
+  }
+}
+
+// Sidebar buttons + inbox banner reflect the current install/notification state.
+async function renderAppTools() {
+  const tools = $('#appTools');
+  if (tools) {
+    tools.innerHTML = `${!pwa.standalone ? '<button id="installBtn">📲 অ্যাপ ইনস্টল করুন</button>' : ''}
+      ${!(await pushEnabled().catch(() => false)) ? '<button id="pushBtn">🔔 নোটিফিকেশন চালু করুন</button>' : ''}`;
+    $('#installBtn')?.addEventListener('click', installApp);
+    $('#pushBtn')?.addEventListener('click', async () => { if (await enablePush()) renderAppTools(); });
+  }
+  const banner = $('#pushBanner');
+  if (banner) {
+    const dismissed = (() => { try { return localStorage.getItem('pushBannerDismissed') === '1'; } catch { return false; } })();
+    const show = !dismissed && !(await pushEnabled().catch(() => false)) && !('Notification' in window && Notification.permission === 'denied');
+    banner.innerHTML = show ? `<div class="push-banner">
+      <span>🔔 নতুন মেসেজ এলে ফোনে নোটিফিকেশন পেতে চালু করুন</span>
+      <span class="row" style="gap:6px;flex-wrap:nowrap"><button class="btn sm" id="pushBannerOn">চালু করুন</button>
+      <button class="btn ghost sm" id="pushBannerX" aria-label="বন্ধ">✕</button></span></div>` : '';
+    $('#pushBannerOn')?.addEventListener('click', async () => {
+      if (pwa.isIOS && !pwa.standalone) return installApp();
+      if (await enablePush()) renderAppTools();
+    });
+    $('#pushBannerX')?.addEventListener('click', () => { try { localStorage.setItem('pushBannerDismissed', '1'); } catch { /* ignore */ } banner.innerHTML = ''; });
+  }
+}
+
+async function notificationCard() {
+  const on = await pushEnabled().catch(() => false);
+  const blocked = 'Notification' in window && Notification.permission === 'denied';
+  return `<div class="card" style="max-width:520px"><h3>🔔 নোটিফিকেশন (এই ডিভাইস)</h3>
+    <div class="hint" style="margin-bottom:10px">চালু থাকলে নতুন গ্রাহক-মেসেজ এলে অ্যাপ বন্ধ থাকলেও এই ফোন/কম্পিউটারে নোটিফিকেশন আসবে।
+      মালিক ও অ্যাডমিনরা সব চ্যাটের, এজেন্টরা নিজের ও অ্যাসাইন-না-হওয়া চ্যাটের নোটিফিকেশন পাবেন। প্রত্যেক ডিভাইসে আলাদাভাবে চালু করতে হয়।</div>
+    ${!pwa.pushSupported && pwa.isIOS && !pwa.standalone
+      ? '<div class="banner">iPhone/iPad-এ নোটিফিকেশন পেতে আগে অ্যাপটি হোম স্ক্রিনে যোগ করুন (নিচের বাটন), তারপর সেই আইকন থেকে খুলে এখানে চালু করুন।</div>'
+      : !pwa.pushSupported ? '<div class="banner">এই ব্রাউজারে নোটিফিকেশন সাপোর্ট নেই। Chrome ব্যবহার করুন।</div>'
+      : blocked ? '<div class="banner">নোটিফিকেশন ব্লক করা আছে। ব্রাউজারের ঠিকানার বারের 🔒 চিহ্ন → Notifications → Allow করুন।</div>' : ''}
+    <div class="row">
+      <span class="pill ${on ? 'agent' : 'off'}">${on ? 'চালু আছে' : 'বন্ধ'}</span>
+      ${pwa.pushSupported && !blocked ? (on
+        ? '<button class="btn ghost sm" id="pushOff">বন্ধ করুন</button><button class="btn sm" id="pushTest">টেস্ট নোটিফিকেশন পাঠান</button>'
+        : '<button class="btn sm" id="pushOn">চালু করুন</button>') : ''}
+      ${!pwa.standalone ? '<button class="btn ghost sm" id="installBtn2">📲 অ্যাপ ইনস্টল করুন</button>' : ''}
+    </div></div>`;
 }
 
 // ---------- boot ----------
@@ -784,6 +945,8 @@ async function boot() {
   renderShell();
   connectEvents();
   route();
+  renderAppTools();
+  syncPush();
 }
 
 window.addEventListener('hashchange', () => {

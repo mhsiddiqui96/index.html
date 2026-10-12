@@ -1,6 +1,7 @@
 import { hashPassword, verifyPassword, encrypt, decrypt, randomToken, sha256Hex } from './crypto.js';
 import * as wa from './whatsapp.js';
 import * as inbox from './inbox.js';
+import { vapidKeys, notifyInbound, notifyUser } from './push.js';
 
 const ROLES = ['owner', 'admin', 'agent'];
 const MANAGERS = ['owner', 'admin'];
@@ -452,13 +453,48 @@ async function route(request, env, ctx, db) {
       LEFT JOIN users u ON u.id = a.user_id WHERE a.workspace_id = ? ORDER BY a.id DESC LIMIT 200`, wsId));
   }
 
+  // ---------- Push notifications (installed app / browser) ----------
+  if (m('GET', '/push/key')) return json({ publicKey: (await vapidKeys(db)).publicKey });
+
+  if (m('POST', '/push/subscribe')) {
+    const endpoint = str(body.endpoint, 1000);
+    const p256dh = str(body.keys?.p256dh, 200);
+    const auth = str(body.keys?.auth, 100);
+    if (!/^https:\/\//.test(endpoint) && !(env.ALLOW_HTTP_PUSH === 'true' && /^http:\/\//.test(endpoint))) fail(400, 'ভুল সাবস্ক্রিপশন');
+    if (!p256dh || !auth) fail(400, 'ভুল সাবস্ক্রিপশন');
+    // One row per device; re-subscribing on a shared device moves it to whoever is logged in now.
+    await db.run(`INSERT INTO push_subscriptions (workspace_id, user_id, endpoint, p256dh, auth, created_ms) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT (endpoint) DO UPDATE SET workspace_id = excluded.workspace_id, user_id = excluded.user_id,
+        p256dh = excluded.p256dh, auth = excluded.auth`, wsId, user.id, endpoint, p256dh, auth, Date.now());
+    return json({ ok: true }, 201);
+  }
+
+  if (m('POST', '/push/test')) {
+    const devices = await notifyUser(db, user.id, {
+      title: 'WA Business SaaS', body: '✅ নোটিফিকেশন ঠিকমতো কাজ করছে!', url: '/#/inbox', tag: 'test',
+    }, url.origin);
+    if (!devices) fail(400, 'এই অ্যাকাউন্টে কোনো ডিভাইসে নোটিফিকেশন চালু নেই');
+    return json({ devices });
+  }
+
+  if (m('POST', '/push/unsubscribe')) {
+    await db.run('DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?', str(body.endpoint, 1000), user.id);
+    return json({ ok: true });
+  }
+
   // ---------- Try the inbox without a live WhatsApp number ----------
   if (m('POST', '/simulate-inbound')) {
     requireRole(user, MANAGERS);
     const waId = phoneDigits(body.phone);
     const text = str(body.text, 4096);
     if (waId.length < 8 || !text) fail(400, 'নাম্বার ও মেসেজ দিন');
-    return json(await inbox.storeInbound(db, wsId, { waId, name: str(body.name, 120) || null, type: 'text', body: text }), 201);
+    const stored = await inbox.storeInbound(db, wsId, { waId, name: str(body.name, 120) || null, type: 'text', body: text });
+    if (stored) {
+      ctx.waitUntil(inbox.conversationView(db, stored.convId)
+        .then((conv) => notifyInbound(db, conv, text, url.origin))
+        .catch((err) => console.error('push failed', err)));
+    }
+    return json(stored, 201);
   }
 
   fail(404, 'পাওয়া যায়নি');
