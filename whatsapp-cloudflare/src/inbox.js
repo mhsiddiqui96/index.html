@@ -2,7 +2,7 @@
 const WINDOW_MS = 24 * 3600 * 1000;
 
 const CONV_SELECT = `
-  SELECT c.*, ct.wa_id, ct.name AS contact_name, u.name AS assigned_name, n.label AS number_label,
+  SELECT c.*, ct.wa_id, ct.name AS contact_name, ct.opted_out, u.name AS assigned_name, n.label AS number_label,
     (SELECT json_group_array(cl.label_id) FROM conversation_labels cl WHERE cl.conversation_id = c.id) AS label_ids,
     (SELECT COUNT(*) FROM notes nt WHERE nt.conversation_id = c.id) AS note_count
   FROM conversations c

@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 
 const graphCalls = [];
 const pushCalls = [];
+let rateLimitedOnce = false;
 let graph, worker, base, stateDir;
 
 before(async () => {
@@ -25,8 +26,16 @@ before(async () => {
         res.statusCode = req.url.includes('gone') ? 410 : 201;
         return res.end();
       }
-      graphCalls.push({ url: req.url, body: raw ? JSON.parse(raw) : null });
+      const parsed = raw ? JSON.parse(raw) : null;
+      graphCalls.push({ url: req.url, body: parsed });
       res.setHeader('Content-Type', 'application/json');
+      // Simulated Meta errors for broadcast tests: one undeliverable number, one that is rate-limited once.
+      if (parsed?.to === '8801999000099') { res.statusCode = 400; return res.end(JSON.stringify({ error: { code: 131026, message: 'Message undeliverable' } })); }
+      if (parsed?.to === '8801999000077' && !rateLimitedOnce) {
+        rateLimitedOnce = true;
+        res.statusCode = 400;
+        return res.end(JSON.stringify({ error: { code: 130429, message: 'Rate limit hit' } }));
+      }
       if (req.url.includes('/messages')) return res.end(JSON.stringify({ messages: [{ id: `wamid.out${graphCalls.length}` }] }));
       if (req.url.includes('message_templates')) {
         return res.end(JSON.stringify({ data: [{ name: 'hello', language: 'bn', status: 'APPROVED', category: 'UTILITY', components: [{ type: 'BODY', text: 'Hi {{1}}' }] }] }));
@@ -39,7 +48,7 @@ before(async () => {
   const port = 8800 + Math.floor(Math.random() * 100);
   base = `http://127.0.0.1:${port}`;
   worker = spawn('node_modules/.bin/wrangler', ['dev', '--port', String(port), '--ip', '127.0.0.1', '--persist-to', stateDir,
-    '--var', `GRAPH_BASE_URL:http://127.0.0.1:${graph.address().port}`, '--var', 'ALLOW_HTTP_PUSH:true'], {
+    '--var', `GRAPH_BASE_URL:http://127.0.0.1:${graph.address().port}`, '--var', 'ALLOW_HTTP_PUSH:true', '--test-scheduled'], {
     env: { ...process.env, NO_PROXY: '127.0.0.1,localhost', no_proxy: '127.0.0.1,localhost', WRANGLER_SEND_METRICS: 'false', CI: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,
@@ -377,6 +386,108 @@ test('several numbers, each with its own team', async () => {
   assert.equal((await owner('GET', `/api/conversations/${conv2.id}/messages`)).status, 404);
   assert.equal((await owner('DELETE', `/api/numbers/${numberId}`, {})).status, 400);
   await owner('PATCH', `/api/users/${agentId}`, { number_ids: [numberId] });
+});
+
+test('import contacts: local formats, labels, hidden from inbox until filtered', async () => {
+  const label = (await owner('POST', '/api/labels', { name: 'ক্লাস ৭', color: '#7c3aed' })).data;
+  const contacts = [
+    { phone: '01999000001', name: 'আব্দুল্লাহ' }, { phone: '+880 1999-000002', name: '' },
+    { phone: '8801999000099', name: 'ভুল নাম্বার' }, { phone: '1999000077', name: 'সীমা' }, { phone: '12', name: 'বাতিল' },
+  ];
+  assert.equal((await agent('POST', '/api/contacts/import', { number_id: numberId, contacts })).status, 403);
+  const r = await owner('POST', '/api/contacts/import', { number_id: numberId, label_ids: [label.id], contacts });
+  assert.equal(r.status, 200);
+  assert.equal(r.data.imported, 4);
+  assert.deepEqual(r.data.invalid, ['12']);
+  assert.ok(!(await owner('GET', '/api/conversations?status=')).data.some((c) => c.wa_id === '8801999000001'));
+  const tagged = (await owner('GET', `/api/conversations?status=&label=${label.id}`)).data;
+  assert.deepEqual(tagged.map((c) => c.wa_id).sort(), ['8801999000001', '8801999000002', '8801999000077', '8801999000099']);
+  assert.equal(tagged.find((c) => c.wa_id === '8801999000001').contact_name, 'আব্দুল্লাহ');
+  // Re-importing is harmless (no duplicates).
+  await owner('POST', '/api/contacts/import', { number_id: numberId, label_ids: [label.id], contacts: contacts.slice(0, 1) });
+  assert.equal((await owner('GET', `/api/conversations?status=&label=${label.id}`)).data.length, 4);
+  broadcastLabel = label.id;
+});
+
+let broadcastLabel;
+test('template broadcast: personalised, batched, reported; STOP opts out', async () => {
+  const prev = await owner('POST', '/api/broadcasts/preview', { number_id: numberId, label_ids: [broadcastLabel], kind: 'template' });
+  assert.deepEqual(prev.data, { total: 4, eligible: 4, opted_out: 0, outside_window: 0 });
+  const before = graphCalls.length;
+  let r = await owner('POST', '/api/broadcasts', {
+    name: 'ক্লাস ৭ নোটিশ', number_id: numberId, label_ids: [broadcastLabel], kind: 'template',
+    template: { name: 'hello', language: 'bn', category: 'UTILITY' }, body: 'Hi {{1}}', params: [{ type: 'name' }], name_fallback: 'অভিভাবক',
+  });
+  assert.equal(r.status, 201);
+  const id = r.data.id;
+  for (let i = 0; i < 5; i++) { await owner('POST', `/api/broadcasts/${id}/run`, {}); await wait(200); }
+  r = await owner('GET', `/api/broadcasts/${id}`);
+  assert.equal(r.data.broadcast.status, 'done');
+  assert.equal(r.data.counts.sent, 3);
+  assert.equal(r.data.counts.failed, 1);
+  assert.equal(r.data.recipients.find((x) => x.wa_id === '8801999000099').error, 'Message undeliverable');
+  // The rate-limited number was retried, not failed.
+  assert.equal(r.data.recipients.find((x) => x.wa_id === '8801999000077').status, 'sent');
+  const sends = graphCalls.slice(before).filter((c) => c.body?.type === 'template');
+  const to1 = sends.find((c) => c.body.to === '8801999000001').body.template.components[0].parameters[0].text;
+  const to2 = sends.find((c) => c.body.to === '8801999000002').body.template.components[0].parameters[0].text;
+  assert.equal(to1, 'আব্দুল্লাহ');
+  assert.equal(to2, 'অভিভাবক');
+  // Copy kept in the chat, but the imported chat still isn't pushed into the inbox.
+  const conv = (await owner('GET', `/api/conversations?status=&label=${broadcastLabel}`)).data.find((c) => c.wa_id === '8801999000001');
+  assert.equal((await owner('GET', `/api/conversations/${conv.id}/messages`)).data.messages.at(-1).body, '📢 Hi আব্দুল্লাহ');
+  // Read receipts flow into the report.
+  const waId = r.data.recipients.find((x) => x.wa_id === '8801999000001');
+  const msgs = (await owner('GET', `/api/conversations/${conv.id}/messages`)).data.messages;
+  await signedWebhook({ entry: [{ changes: [{ field: 'messages', value: { metadata: { phone_number_id: '111222' }, statuses: [{ id: msgs.at(-1).wa_message_id, status: 'read' }] } }] }] });
+  await wait(400);
+  assert.equal((await owner('GET', `/api/broadcasts/${id}`)).data.counts.read, 1);
+  assert.ok(waId);
+
+  // STOP from a recipient: opted out, confirmation sent, skipped next time.
+  await signedWebhook(inbound('wamid.stop1', 'STOP', '8801999000002'));
+  await wait(600);
+  assert.ok(graphCalls.some((c) => c.body?.to === '8801999000002' && c.body?.type === 'text' && /START/.test(c.body.text.body)));
+  const prev2 = await owner('POST', '/api/broadcasts/preview', { number_id: numberId, label_ids: [broadcastLabel], kind: 'template' });
+  assert.equal(prev2.data.opted_out, 1);
+  // Plain text only reaches people inside the 24h window (here: just the one who wrote STOP, who is opted out).
+  const prev3 = await owner('POST', '/api/broadcasts/preview', { number_id: numberId, label_ids: [broadcastLabel], kind: 'text' });
+  assert.equal(prev3.data.eligible, 0);
+  assert.equal(prev3.data.outside_window, 3);
+  await signedWebhook(inbound('wamid.start1', 'START', '8801999000002'));
+  await wait(600);
+  assert.equal((await owner('POST', '/api/broadcasts/preview', { number_id: numberId, label_ids: [broadcastLabel], kind: 'text' })).data.eligible, 1);
+});
+
+test('scheduled broadcast waits, can be cancelled; cron sends due ones', async () => {
+  let r = await owner('POST', '/api/broadcasts', {
+    name: 'পরে', number_id: numberId, label_ids: [broadcastLabel], kind: 'text', body: 'আসসালামু আলাইকুম {{নাম}}',
+    scheduled_ms: Date.now() + 3600e3,
+  });
+  const later = r.data.id;
+  await owner('POST', `/api/broadcasts/${later}/run`, {});
+  r = await owner('GET', `/api/broadcasts/${later}`);
+  assert.equal(r.data.broadcast.status, 'scheduled');
+  assert.equal(r.data.counts.pending, 1);
+  assert.equal((await owner('POST', `/api/broadcasts/${later}/cancel`, {})).status, 200);
+  assert.equal((await owner('GET', `/api/broadcasts/${later}`)).data.broadcast.status, 'cancelled');
+
+  // Due in a moment: the scheduled (cron) handler sends it.
+  r = await owner('POST', '/api/broadcasts', {
+    name: 'ক্রন', number_id: numberId, label_ids: [broadcastLabel], kind: 'text', body: 'হ্যালো {{নাম}}', scheduled_ms: Date.now() + 1500,
+  });
+  const due = r.data.id;
+  await wait(2000);
+  const res = await fetch(`${base}/cdn-cgi/handler/scheduled?cron=*+*+*+*+*`);
+  assert.equal(res.status, 200);
+  await wait(800);
+  r = await owner('GET', `/api/broadcasts/${due}`);
+  assert.equal(r.data.counts.sent, 1);
+  // The STOP/START messages came with the WhatsApp profile name "Rahim", which is used for {{নাম}}.
+  assert.ok(graphCalls.some((c) => c.body?.to === '8801999000002' && c.body?.text?.body === 'হ্যালো Rahim'));
+  const list = (await owner('GET', '/api/broadcasts')).data;
+  assert.deepEqual(list.slice(0, 3).map((b) => b.name), ['ক্রন', 'পরে', 'ক্লাস ৭ নোটিশ']);
+  assert.equal((await agent('GET', '/api/broadcasts')).status, 403);
 });
 
 test('deactivated user is logged out', async () => {

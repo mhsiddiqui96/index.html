@@ -121,6 +121,7 @@ async function renderAuth(mode) {
 // ---------- shell ----------
 const NAV = [
   { id: 'inbox', icon: '💬', label: 'ইনবক্স' },
+  { id: 'broadcast', icon: '📢', label: 'ব্রডকাস্ট', manager: true },
   { id: 'dashboard', icon: '📊', label: 'ড্যাশবোর্ড' },
   { id: 'team', icon: '👥', label: 'টিম / অ্যাডমিন' },
   { id: 'quick', icon: '⚡', label: 'কুইক রিপ্লাই' },
@@ -163,7 +164,7 @@ function route() {
   const [page, arg] = location.hash.replace(/^#\//, '').split('/');
   const target = NAV.find((n) => n.id === page && (!n.manager || isManager())) ? page : 'inbox';
   $$('[data-nav]').forEach((a) => a.classList.toggle('active', a.dataset.nav === target));
-  const pages = { inbox: pageInbox, dashboard: pageDashboard, team: pageTeam, quick: pageQuick, labels: pageLabels, settings: pageSettings, activity: pageActivity, account: pageAccount };
+  const pages = { inbox: pageInbox, dashboard: pageDashboard, team: pageTeam, quick: pageQuick, labels: pageLabels, broadcast: pageBroadcast, settings: pageSettings, activity: pageActivity, account: pageAccount };
   pages[target](arg);
 }
 
@@ -245,6 +246,7 @@ function matchesFilters(c) {
   if (state.filter === 'unassigned' && c.assigned_to != null) return false;
   if (state.numberFilter && c.number_id !== Number(state.numberFilter)) return false;
   if (state.labelFilter && !(c.label_ids || []).includes(Number(state.labelFilter))) return false;
+  if (!c.last_message_ms && !state.labelFilter && !state.q) return false;
   if (state.q) {
     const q = state.q.toLowerCase();
     if (!(c.contact_name || '').toLowerCase().includes(q) && !c.wa_id.includes(q)) return false;
@@ -378,7 +380,7 @@ function renderChatHead() {
     <button class="btn ghost sm back" id="backBtn">←</button>
     <div class="avatar" style="background:${avatarColor(c.wa_id)}">${esc(initials(c.contact_name || c.wa_id.slice(-2)))}</div>
     <div class="who"><b>${esc(c.contact_name || '+' + c.wa_id)}</b><span>+${esc(c.wa_id)}${multiNumber() ? ` · 📞 ${esc(c.number_label)}` : ''} ${c.window_open ? '· 🟢 ২৪ ঘণ্টার উইন্ডো খোলা' : '· ⏳ শুধু টেমপ্লেট'}</span>
-      <div class="lbls">${labelChips(c.label_ids)}</div></div>
+      <div class="lbls">${labelChips(c.label_ids)}${c.opted_out ? '<span class="lbl" style="--c:#6b7280">🚫 ব্রডকাস্ট বন্ধ (STOP)</span>' : ''}</div></div>
     <button class="btn ghost sm" id="labelBtn" title="লেবেল" aria-label="লেবেল">🏷️<span class="hide-sm"> লেবেল</span></button>
     <button class="btn ghost sm" id="notesBtn" title="নোট" aria-label="নোট">📝<span class="hide-sm"> নোট</span>${c.note_count ? ` (${c.note_count})` : ''}</button>
     <select id="assignSel" title="অ্যাসাইন">
@@ -952,12 +954,394 @@ async function pageLabels() {
   }));
 }
 
+// ---------- broadcasts & contact import ----------
+const BC_STATUS = { scheduled: ['🕓 শিডিউল করা', 'admin'], sending: ['📤 পাঠানো হচ্ছে', 'agent'], done: ['✅ শেষ', 'agent'], cancelled: ['⛔ বাতিল', 'off'] };
+const bcPill = (s) => `<span class="pill ${BC_STATUS[s]?.[1] || ''}">${BC_STATUS[s]?.[0] || s}</span>`;
+let bcTimer = null;
+
+async function pageBroadcast(arg) {
+  clearTimeout(bcTimer);
+  if (!state.labels.length) await loadLabels();
+  if (arg === 'new') return pageBroadcastNew();
+  if (arg === 'import') return pageImport();
+  if (arg) return pageBroadcastReport(Number(arg));
+  const list = await api('/broadcasts');
+  $('#main').innerHTML = `<div class="page">
+    <div class="row" style="justify-content:space-between;margin-bottom:16px">
+      <h2 style="margin:0">📢 ব্রডকাস্ট</h2>
+      <span class="row"><a class="btn ghost" href="#/broadcast/import">👥 কন্টাক্ট ইমপোর্ট</a><a class="btn" href="#/broadcast/new">＋ নতুন ব্রডকাস্ট</a></span>
+    </div>
+    <div class="card hint">
+      একটি মেসেজ একসাথে অনেককে — লেবেল ধরে (যেমন "ক্লাস ৫")। প্রত্যেকে আলাদা মেসেজ হিসেবে পান, উত্তর দিলে ইনবক্সে আসে।
+      <ul class="steps">
+        <li>যারা গত ২৪ ঘণ্টায় মেসেজ দেননি, তাদের শুধু Meta-অনুমোদিত <b>টেমপ্লেট</b> পাঠানো যায় (Meta প্রতি মেসেজের দাম নেয়)।</li>
+        <li>শুধু পরিচিতদের পাঠান — অচেনাদের পাঠালে Block/Report বাড়ে, নাম্বার ঝুঁকিতে পড়ে। কেউ <b>STOP</b> বা <b>বন্ধ</b> লিখলে তাকে আর পাঠানো হয় না।</li>
+        <li>নতুন নাম্বারে দিনে প্রায় ২৫০ জনকে প্রথম মেসেজ পাঠানো যায়; ভালো ব্যবহারে Meta সীমা বাড়ায়। অ্যাপ ধীরে ধীরে পাঠায়।</li>
+      </ul>
+    </div>
+    <div class="card">${list.length ? `<table><thead><tr><th>নাম</th><th class="hide-sm">নাম্বার</th><th>অবস্থা</th><th>পাঠানো</th><th class="hide-sm">সময়</th></tr></thead><tbody>
+      ${list.map((b) => `<tr class="clickable" data-bc="${b.id}">
+        <td><b>${esc(b.name)}</b><div class="hint">${b.kind === 'template' ? '📋 টেমপ্লেট' : '✍️ লেখা'}</div></td>
+        <td class="hide-sm hint">${esc(b.number_label)}</td>
+        <td>${bcPill(b.status)}</td>
+        <td>${b.sent}/${b.total}${b.failed ? ` <span class="hint">· ব্যর্থ ${b.failed}</span>` : ''}</td>
+        <td class="hide-sm hint">${parseTime(b.scheduled_ms).toLocaleString('bn-BD')}</td></tr>`).join('')}
+      </tbody></table>` : '<div class="empty">এখনো কোনো ব্রডকাস্ট পাঠানো হয়নি।<br>আগে কন্টাক্ট ইমপোর্ট করে লেবেল দিন, তারপর নতুন ব্রডকাস্ট।</div>'}</div>
+  </div>`;
+  $$('[data-bc]').forEach((tr) => (tr.onclick = () => { location.hash = `#/broadcast/${tr.dataset.bc}`; }));
+}
+
+const labelChecks = (name, selected = []) => `<div class="checks label-checks">${state.labels.map((l) => `<label>
+  <input type="checkbox" name="${name}" value="${l.id}" ${selected.includes(l.id) ? 'checked' : ''} style="width:auto">
+  <span class="lbl" style="--c:${esc(l.color)}">${esc(l.name)}</span></label>`).join('') || '<div class="hint">কোনো লেবেল নেই</div>'}</div>`;
+const numberSelect = (name = 'number_id') => `<select name="${name}">${state.numbers.map((n) => `<option value="${n.id}">${esc(n.label)}${n.connected ? '' : ' (কানেক্ট হয়নি)'}</option>`).join('')}</select>`;
+const checkedIds = (root, name) => $$(`input[name=${name}]:checked`, root).map((i) => Number(i.value));
+
+// --- import ---
+function normalizePhoneClient(raw) {
+  let d = String(raw ?? '').replace(/\D/g, '');
+  if (d.startsWith('00')) d = d.slice(2);
+  if (d.length === 11 && d.startsWith('01')) d = '88' + d;
+  else if (d.length === 10 && d.startsWith('1')) d = '880' + d;
+  return d.length >= 8 && d.length <= 15 ? d : null;
+}
+
+function parseDelimited(text) {
+  const lines = text.replace(/\r/g, '').split('\n').filter((l) => l.trim());
+  const sample = lines.slice(0, 5).join('\n');
+  const delim = sample.includes('\t') ? '\t' : sample.includes(';') && !sample.includes(',') ? ';' : ',';
+  return lines.map((line) => {
+    const cells = []; let cur = ''; let q = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { if (q && line[i + 1] === '"') { cur += '"'; i++; } else q = !q; }
+      else if (ch === delim && !q) { cells.push(cur.trim()); cur = ''; }
+      else cur += ch;
+    }
+    cells.push(cur.trim());
+    return cells;
+  });
+}
+
+let xlsxLoading = null;
+function loadXlsx() {
+  if (window.XLSX) return Promise.resolve(window.XLSX);
+  xlsxLoading ||= new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    s.onload = () => resolve(window.XLSX);
+    s.onerror = () => { xlsxLoading = null; reject(new Error('Excel পড়ার টুল লোড হয়নি — ইন্টারনেট দেখুন, অথবা ফাইলটি CSV হিসেবে সেভ করুন')); };
+    document.head.appendChild(s);
+  });
+  return xlsxLoading;
+}
+
+// Pick the phone and name columns automatically; the first row is a header if it has no phone number in it.
+function detectColumns(rows) {
+  const width = Math.max(...rows.slice(0, 50).map((r) => r.length), 0);
+  const hasHeader = rows.length > 1 && !rows[0].some((c) => normalizePhoneClient(c));
+  const body = hasHeader ? rows.slice(1) : rows;
+  let phone = 0; let best = -1;
+  for (let i = 0; i < width; i++) {
+    const hits = body.slice(0, 50).filter((r) => normalizePhoneClient(r[i])).length;
+    if (hits > best) { best = hits; phone = i; }
+  }
+  let name = -1;
+  if (hasHeader) name = rows[0].findIndex((h, i) => i !== phone && /name|নাম/i.test(h));
+  if (name < 0) name = [...Array(width).keys()].find((i) => i !== phone && body.slice(0, 20).some((r) => r[i] && !normalizePhoneClient(r[i]))) ?? -1;
+  return { hasHeader, phone, name, headers: hasHeader ? rows[0] : [...Array(width).keys()].map((i) => `কলাম ${i + 1}`) };
+}
+
+function pageImport() {
+  let rows = [];
+  let cols = null;
+  $('#main').innerHTML = `<div class="page">
+    <h2><a href="#/broadcast" class="back-link">📢</a> 👥 কন্টাক্ট ইমপোর্ট</h2>
+    <div class="card">
+      <h3>১. নাম্বারের তালিকা দিন</h3>
+      <div class="hint">Excel (.xlsx), CSV ফাইল বেছে নিন — অথবা Excel/Google Sheet থেকে নাম ও নাম্বারের ঘরগুলো কপি করে নিচে পেস্ট করুন। 01XXXXXXXXX ফরম্যাট চলবে।</div>
+      <input type="file" id="impFile" accept=".csv,.txt,.xlsx,.xls" style="margin-top:10px">
+      <textarea id="impText" rows="5" placeholder="রহিম	01712345678&#10;করিম	01812345678" style="margin-top:10px"></textarea>
+      <div id="impCols" class="grid2"></div>
+      <div id="impPreview"></div>
+    </div>
+    <div class="card">
+      <h3>২. কোথায় যোগ হবে</h3>
+      ${multiNumber() ? `<label>কোন নাম্বারের কন্টাক্ট</label>${numberSelect()}` : ''}
+      <label>লেবেল (যেমন: ক্লাস ৫, অভিভাবক) — পরে এই লেবেল ধরে ব্রডকাস্ট পাঠাবেন</label>
+      <div id="impLabels">${labelChecks('imp_labels')}</div>
+      <div class="row" style="margin-top:8px;flex-wrap:nowrap"><input id="impNewLabel" maxlength="40" placeholder="নতুন লেবেলের নাম"><button type="button" class="btn ghost sm" id="impAddLabel">＋ লেবেল</button></div>
+      <div class="row" style="margin-top:16px"><button class="btn" id="impGo" disabled>ইমপোর্ট করুন</button><span id="impStatus" class="hint"></span></div>
+      <div class="progress" id="impBar" hidden><div></div></div>
+    </div>
+  </div>`;
+  const contactsFromRows = () => {
+    if (!cols) return { valid: [], invalid: [] };
+    const body = cols.hasHeader ? rows.slice(1) : rows;
+    const valid = []; const invalid = [];
+    for (const r of body) {
+      const phone = normalizePhoneClient(r[cols.phone]);
+      const name = cols.name >= 0 ? (r[cols.name] || '').trim() : '';
+      if (phone) valid.push({ phone, name }); else if ((r[cols.phone] || '').trim()) invalid.push(r[cols.phone]);
+    }
+    const seen = new Set();
+    const unique = valid.filter((c) => !seen.has(c.phone) && seen.add(c.phone));
+    return { valid: unique, invalid };
+  };
+  const renderPreview = () => {
+    const { valid, invalid } = contactsFromRows();
+    $('#impCols').innerHTML = cols ? `<div><label>নাম্বারের কলাম</label><select id="colPhone">${cols.headers.map((h, i) => `<option value="${i}" ${i === cols.phone ? 'selected' : ''}>${esc(h || `কলাম ${i + 1}`)}</option>`).join('')}</select></div>
+      <div><label>নামের কলাম</label><select id="colName"><option value="-1">— নাম নেই —</option>${cols.headers.map((h, i) => `<option value="${i}" ${i === cols.name ? 'selected' : ''}>${esc(h || `কলাম ${i + 1}`)}</option>`).join('')}</select></div>` : '';
+    $('#colPhone')?.addEventListener('change', (e) => { cols.phone = Number(e.target.value); renderPreview(); });
+    $('#colName')?.addEventListener('change', (e) => { cols.name = Number(e.target.value); renderPreview(); });
+    $('#impPreview').innerHTML = cols ? `<div class="banner" style="margin-top:12px">✅ ${valid.length.toLocaleString('bn-BD')}টি নাম্বার পাওয়া গেছে${invalid.length ? ` · ⚠ ${invalid.length.toLocaleString('bn-BD')}টি বাদ যাবে (ভুল ফরম্যাট)` : ''}</div>
+      <table><thead><tr><th>নাম</th><th>নাম্বার</th></tr></thead><tbody>${valid.slice(0, 8).map((c) => `<tr><td>${esc(c.name || '—')}</td><td>+${esc(c.phone)}</td></tr>`).join('')}</tbody></table>
+      ${valid.length > 8 ? `<div class="hint">…আরও ${(valid.length - 8).toLocaleString('bn-BD')} জন</div>` : ''}` : '';
+    $('#impGo').disabled = !valid.length;
+  };
+  const useRows = (r) => { rows = r.filter((x) => x.some((c) => String(c ?? '').trim())).map((x) => x.map((c) => String(c ?? ''))); cols = rows.length ? detectColumns(rows) : null; renderPreview(); };
+  $('#impText').oninput = (e) => useRows(parseDelimited(e.target.value));
+  $('#impFile').onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      if (/\.xlsx?$/i.test(file.name)) {
+        const XLSX = await loadXlsx();
+        const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
+        useRows(XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, raw: false }));
+      } else {
+        useRows(parseDelimited(await file.text()));
+      }
+    } catch (err) { toast(err.message, true); }
+  };
+  $('#impAddLabel').onclick = async () => {
+    const name = $('#impNewLabel').value.trim();
+    if (!name) return;
+    try {
+      const keep = checkedIds($('#impLabels'), 'imp_labels');
+      const label = await api('/labels', { method: 'POST', body: { name, color: LABEL_COLORS[state.labels.length % LABEL_COLORS.length] } });
+      state.labels.push(label);
+      $('#impLabels').innerHTML = labelChecks('imp_labels', [...keep, label.id]);
+      $('#impNewLabel').value = '';
+    } catch (err) { toast(err.message, true); }
+  };
+  $('#impGo').onclick = async () => {
+    const { valid } = contactsFromRows();
+    const labelIds = checkedIds($('#impLabels'), 'imp_labels');
+    const numberId = Number($('#main select[name=number_id]')?.value || state.numbers[0]?.id);
+    if (!labelIds.length && !confirm('কোনো লেবেল বাছাই করা হয়নি। লেবেল ছাড়া ইমপোর্ট করলে ব্রডকাস্টে বাছাই করা কঠিন হবে। তবুও চালিয়ে যাবেন?')) return;
+    $('#impGo').disabled = true;
+    const bar = $('#impBar'); bar.hidden = false;
+    let done = 0; let bad = 0;
+    try {
+      for (let i = 0; i < valid.length; i += 90) {
+        const r = await api('/contacts/import', { method: 'POST', body: { number_id: numberId, label_ids: labelIds, contacts: valid.slice(i, i + 90) } });
+        done += r.imported; bad += r.invalid.length;
+        $('div', bar).style.width = `${Math.round(((i + 90) / valid.length) * 100)}%`;
+        $('#impStatus').textContent = `${done.toLocaleString('bn-BD')} / ${valid.length.toLocaleString('bn-BD')} যোগ হয়েছে…`;
+      }
+      $('#impStatus').textContent = `✅ ${done.toLocaleString('bn-BD')}টি কন্টাক্ট যোগ হয়েছে${bad ? ` · ${bad}টি বাদ` : ''}`;
+      toast('ইমপোর্ট শেষ — এখন ব্রডকাস্ট পাঠাতে পারেন');
+      await loadLabels();
+    } catch (err) { toast(err.message, true); $('#impGo').disabled = false; }
+  };
+}
+
+// --- new broadcast ---
+async function pageBroadcastNew() {
+  const hasLabels = state.labels.length;
+  $('#main').innerHTML = `<div class="page">
+    <h2><a href="#/broadcast" class="back-link">📢</a> নতুন ব্রডকাস্ট</h2>
+    <form id="bcForm">
+      <div class="card">
+        <h3>১. কাদের পাঠাবেন</h3>
+        <label>ব্রডকাস্টের নাম (শুধু আপনার টিম দেখবে)</label><input name="name" required maxlength="100" placeholder="যেমন: ক্লাস ৫ — ছুটির নোটিশ">
+        ${multiNumber() ? `<label>কোন নাম্বার থেকে</label>${numberSelect()}` : ''}
+        <label>লেবেল (যেকোনো একটি থাকলেই পাবেন)</label>
+        ${hasLabels ? labelChecks('bc_labels') : '<div class="banner">আগে <a href="#/broadcast/import">কন্টাক্ট ইমপোর্ট</a> করে লেবেল দিন।</div>'}
+        <div id="bcCount" class="banner" style="margin-top:10px" hidden></div>
+      </div>
+      <div class="card">
+        <h3>২. কী পাঠাবেন</h3>
+        <div class="row">
+          <label class="radio"><input type="radio" name="kind" value="template" checked> 📋 টেমপ্লেট (সবাইকে পাঠানো যায়)</label>
+          <label class="radio"><input type="radio" name="kind" value="text"> ✍️ সাধারণ লেখা (শুধু গত ২৪ ঘণ্টায় যারা মেসেজ দিয়েছেন)</label>
+        </div>
+        <div id="bcTemplate"></div>
+        <div id="bcText" hidden>
+          <label>মেসেজ</label><textarea name="body" rows="4" placeholder="আসসালামু আলাইকুম {{নাম}}, ..."></textarea>
+          <button type="button" class="btn ghost sm" id="insName" style="margin-top:6px">＋ {{নাম}} বসান</button>
+        </div>
+        <label>নাম না থাকলে কী লিখবে</label><input name="name_fallback" value="অভিভাবক" maxlength="60">
+        <label>প্রিভিউ</label><div class="card preview-bubble" id="bcPreview"></div>
+      </div>
+      <div class="card">
+        <h3>৩. কখন পাঠাবেন</h3>
+        <div class="row">
+          <label class="radio"><input type="radio" name="when" value="now" checked> এখনই</label>
+          <label class="radio"><input type="radio" name="when" value="later"> পরে</label>
+          <input type="datetime-local" name="at" style="width:auto" hidden>
+        </div>
+        <div class="row" style="margin-top:16px"><button class="btn" id="bcSend">📢 ব্রডকাস্ট পাঠান</button></div>
+      </div>
+    </form>
+  </div>`;
+  const form = $('#bcForm');
+  let templates = [];
+  let tpl = null;
+  const numberId = () => Number(form.number_id?.value || state.numbers[0]?.id);
+  const kind = () => form.kind.value;
+  const bodyOf = (t) => (t?.components || []).find((x) => x.type === 'BODY')?.text || '';
+  const headerOf = (t) => (t?.components || []).find((x) => x.type === 'HEADER' && ['IMAGE', 'DOCUMENT', 'VIDEO'].includes(x.format));
+  const paramSpecs = () => $$('[data-pmode]', form).map((sel) => (sel.value === 'name'
+    ? { type: 'name' } : { type: 'text', value: $(`[data-pval="${sel.dataset.pmode}"]`, form).value }));
+  const renderPreview = () => {
+    const sample = 'রহিম';
+    let text;
+    if (kind() === 'template') {
+      text = bodyOf(tpl);
+      paramSpecs().forEach((p, i) => { text = text.split(`{{${i + 1}}}`).join(p.type === 'name' ? sample : p.value || `{{${i + 1}}}`); });
+    } else text = (form.body.value || '').split('{{নাম}}').join(sample);
+    $('#bcPreview').textContent = text || '—';
+  };
+  const renderTemplate = () => {
+    const box = $('#bcTemplate');
+    if (!templates.length) { box.innerHTML = '<div class="banner">এই নাম্বারে কোনো অনুমোদিত টেমপ্লেট নেই। Meta-র <b>WhatsApp Manager → Message templates</b> থেকে টেমপ্লেট বানিয়ে অনুমোদন নিন।</div>'; return; }
+    const nums = [...new Set([...bodyOf(tpl).matchAll(/\{\{(\d+)\}\}/g)].map((m) => Number(m[1])))].sort((a, b) => a - b);
+    const header = headerOf(tpl);
+    box.innerHTML = `<label>টেমপ্লেট</label><select id="tplSel">${templates.map((t, i) => `<option value="${i}" ${t === tpl ? 'selected' : ''}>${esc(t.name)} (${esc(t.language)}) — ${esc(t.category)}</option>`).join('')}</select>
+      ${tpl.category === 'MARKETING' ? '<div class="hint">ℹ️ এটি MARKETING টেমপ্লেট — Meta এর দাম বেশি নেয়। নোটিশ/রিমাইন্ডারের জন্য UTILITY টেমপ্লেট সস্তা।</div>' : ''}
+      ${nums.map((n, i) => `<div class="row" style="flex-wrap:nowrap;margin-top:8px"><span style="min-width:48px">{{${n}}}</span>
+        <select data-pmode="${n}" style="width:auto"><option value="name" ${i === 0 ? 'selected' : ''}>গ্রাহকের নাম</option><option value="text" ${i === 0 ? '' : 'selected'}>নির্দিষ্ট লেখা</option></select>
+        <input data-pval="${n}" placeholder="লেখা" ${i === 0 ? 'hidden' : ''}></div>`).join('')}
+      ${header ? `<label>হেডারের ${header.format === 'IMAGE' ? 'ছবি' : header.format === 'VIDEO' ? 'ভিডিও' : 'ফাইল (PDF)'} — পাবলিক লিংক (https://…)</label><input name="header_link" required placeholder="https://...">` : ''}`;
+    $('#tplSel').onchange = (e) => { tpl = templates[Number(e.target.value)]; renderTemplate(); };
+    $$('[data-pmode]', box).forEach((s) => (s.onchange = () => { $(`[data-pval="${s.dataset.pmode}"]`, box).hidden = s.value === 'name'; renderPreview(); }));
+    $$('[data-pval]', box).forEach((i) => (i.oninput = renderPreview));
+    renderPreview();
+  };
+  const loadTemplates = async () => {
+    $('#bcTemplate').innerHTML = '<div class="hint">টেমপ্লেট লোড হচ্ছে…</div>';
+    try { templates = await api(`/numbers/${numberId()}/templates`); } catch (err) {
+      templates = [];
+      if ($('#bcTemplate')) $('#bcTemplate').innerHTML = `<div class="banner">${esc(err.message)}</div>`;
+      return;
+    }
+    if (!$('#bcTemplate')) return;
+    tpl = templates[0];
+    renderTemplate();
+  };
+  let countTimer;
+  const updateCount = () => {
+    clearTimeout(countTimer);
+    countTimer = setTimeout(async () => {
+      const labelIds = checkedIds(form, 'bc_labels');
+      const box = $('#bcCount');
+      if (!box) return; // left the page
+      if (!labelIds.length) { box.hidden = true; return; }
+      try {
+        const c = await api('/broadcasts/preview', { method: 'POST', body: { number_id: numberId(), label_ids: labelIds, kind: kind() } });
+        box.hidden = false;
+        box.innerHTML = `👥 <b>${c.eligible.toLocaleString('bn-BD')} জন</b> পাবেন${c.opted_out ? ` · ${c.opted_out.toLocaleString('bn-BD')} জন STOP করেছেন` : ''}${c.outside_window ? ` · ${c.outside_window.toLocaleString('bn-BD')} জন ২৪ ঘণ্টার বাইরে (তাদের জন্য টেমপ্লেট লাগবে)` : ''}
+          ${c.eligible > 250 ? '<div class="hint">⚠ নতুন নাম্বারে দিনে প্রায় ২৫০ জনের সীমা থাকতে পারে — বাকিরা Meta সীমা বাড়ালে পরে যাবে।</div>' : ''}`;
+        box.dataset.eligible = c.eligible;
+      } catch (err) { box.hidden = false; box.textContent = err.message; }
+    }, 250);
+  };
+  $$('input[name=bc_labels]', form).forEach((i) => (i.onchange = updateCount));
+  form.number_id?.addEventListener('change', () => { updateCount(); if (kind() === 'template') loadTemplates(); });
+  $$('input[name=kind]', form).forEach((r) => (r.onchange = () => {
+    $('#bcTemplate').hidden = kind() !== 'template';
+    $('#bcText').hidden = kind() !== 'text';
+    updateCount(); renderPreview();
+  }));
+  $$('input[name=when]', form).forEach((r) => (r.onchange = () => { form.at.hidden = form.when.value !== 'later'; }));
+  form.body.oninput = renderPreview;
+  $('#insName').onclick = () => { form.body.value += '{{নাম}}'; renderPreview(); form.body.focus(); };
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const labelIds = checkedIds(form, 'bc_labels');
+    if (!labelIds.length) return toast('অন্তত একটি লেবেল বাছাই করুন', true);
+    if (kind() === 'template' && !tpl) return toast('টেমপ্লেট বাছাই করুন', true);
+    let scheduled = null;
+    if (form.when.value === 'later') {
+      scheduled = form.at.value ? new Date(form.at.value).getTime() : NaN;
+      if (!(scheduled > Date.now())) return toast('ভবিষ্যতের একটি সময় দিন', true);
+    }
+    let eligible;
+    try { eligible = (await api('/broadcasts/preview', { method: 'POST', body: { number_id: numberId(), label_ids: labelIds, kind: kind() } })).eligible; } catch (err) { return toast(err.message, true); }
+    if (!eligible) return toast(kind() === 'text' ? 'এই লেবেলে গত ২৪ ঘণ্টায় কেউ মেসেজ দেননি — টেমপ্লেট বেছে নিন' : 'এই লেবেলে পাঠানোর মতো কেউ নেই', true);
+    if (!confirm(`${eligible.toLocaleString('bn-BD')} জনকে এই মেসেজ পাঠানো হবে${scheduled ? ` (${new Date(scheduled).toLocaleString('bn-BD')})` : ''}।${kind() === 'template' ? '\nMeta প্রতি মেসেজের দাম নেবে।' : ''}\nনিশ্চিত?`)) return;
+    const header = headerOf(tpl);
+    const body = {
+      name: form.name.value, number_id: numberId(), label_ids: labelIds, kind: kind(), name_fallback: form.name_fallback.value,
+      scheduled_ms: scheduled || undefined,
+      ...(kind() === 'template'
+        ? { template: { name: tpl.name, language: tpl.language, category: tpl.category }, body: bodyOf(tpl), params: paramSpecs(),
+          header: header ? { type: header.format.toLowerCase(), link: form.header_link.value } : undefined }
+        : { body: form.body.value }),
+    };
+    $('#bcSend').disabled = true;
+    try {
+      const r = await api('/broadcasts', { method: 'POST', body });
+      toast(scheduled ? 'ব্রডকাস্ট শিডিউল করা হয়েছে' : 'পাঠানো শুরু হয়েছে');
+      location.hash = `#/broadcast/${r.id}`;
+    } catch (err) { toast(err.message, true); $('#bcSend').disabled = false; }
+  };
+  loadTemplates();
+}
+
+// --- report ---
+async function pageBroadcastReport(id) {
+  clearTimeout(bcTimer);
+  let data;
+  try { data = await api(`/broadcasts/${id}`); } catch (err) { toast(err.message, true); location.hash = '#/broadcast'; return; }
+  if (location.hash !== `#/broadcast/${id}`) return;
+  const { broadcast: b, counts: c, recipients } = data;
+  const active = c.total - c.skipped;
+  const done = c.sent + c.failed;
+  const R_STATUS = { pending: '🕓 বাকি', sending: '📤 যাচ্ছে', sent: '✓ পাঠানো', failed: '⚠ ব্যর্থ', skipped: '— বাদ' };
+  const MSG = { delivered: '✓✓ পৌঁছেছে', read: '✓✓ পড়েছে' };
+  $('#main').innerHTML = `<div class="page">
+    <h2><a href="#/broadcast" class="back-link">📢</a> ${esc(b.name)} ${bcPill(b.status)}</h2>
+    <div class="hint" style="margin-bottom:12px">📞 ${esc(b.number_label)} · ${b.kind === 'template' ? `📋 ${esc(b.template_name)}` : '✍️ লেখা'} · ${esc(b.created_by_name || '')} · ${parseTime(b.scheduled_ms).toLocaleString('bn-BD')}</div>
+    <div class="card"><div class="progress"><div style="width:${active ? Math.round((done / active) * 100) : 100}%"></div></div>
+      <div class="stats" style="margin:14px 0 0">
+        ${[['sent', 'পাঠানো'], ['delivered', 'পৌঁছেছে'], ['read', 'পড়েছে'], ['replied', 'উত্তর দিয়েছে'], ['pending', 'বাকি'], ['failed', 'ব্যর্থ'], ['skipped', 'বাদ পড়েছে']]
+          .map(([k, l]) => `<div class="stat"><div class="n">${(c[k] || 0).toLocaleString('bn-BD')}</div><div class="l">${l}</div></div>`).join('')}
+      </div>
+      ${['scheduled', 'sending'].includes(b.status) ? `<button class="btn ghost sm" id="bcCancel" style="margin-top:12px">⛔ বাকিগুলো বাতিল করুন</button>` : ''}
+      ${b.status === 'scheduled' && b.scheduled_ms > Date.now() ? `<div class="hint" style="margin-top:8px">নির্দিষ্ট সময়ে নিজে থেকেই পাঠানো শুরু হবে — অ্যাপ খোলা রাখার দরকার নেই।</div>` : ''}
+      ${b.status === 'sending' ? '<div class="hint" style="margin-top:8px">পাঠানো চলছে। পেজ বন্ধ করলেও প্রতি মিনিটে নিজে থেকে বাকিগুলো যাবে।</div>' : ''}
+    </div>
+    <div class="card"><div class="hint" style="white-space:pre-wrap;margin-bottom:10px">${esc((b.params || []).reduce((t, x, i) => t.split(`{{${i + 1}}}`).join(x.type === 'name' ? '[নাম]' : x.value), b.body).split('{{নাম}}').join('[নাম]'))}</div>
+      <table><thead><tr><th>নাম</th><th>নাম্বার</th><th>অবস্থা</th><th class="hide-sm">কারণ</th></tr></thead><tbody>
+      ${recipients.map((r) => `<tr><td>${esc(r.name || '—')}</td><td>+${esc(r.wa_id)}</td>
+        <td>${r.status === 'sent' ? (MSG[r.message_status] || R_STATUS.sent) : R_STATUS[r.status]}${r.replied ? ` · <a href="#/inbox/${r.conversation_id}">💬 উত্তর</a>` : ''}</td>
+        <td class="hide-sm hint">${esc(r.error || '')}</td></tr>`).join('')}
+      </tbody></table></div>
+  </div>`;
+  $('#bcCancel')?.addEventListener('click', async () => {
+    if (!confirm('যাদের এখনো পাঠানো হয়নি, তাদের আর পাঠানো হবে না। নিশ্চিত?')) return;
+    try { await api(`/broadcasts/${id}/cancel`, { method: 'POST', body: {} }); pageBroadcastReport(id); } catch (err) { toast(err.message, true); }
+  });
+  // While this page is open, keep sending in small batches (the cron job also does this every minute).
+  if (b.status === 'sending' || (b.status === 'scheduled' && b.scheduled_ms <= Date.now())) {
+    bcTimer = setTimeout(async () => {
+      if (location.hash !== `#/broadcast/${id}`) return;
+      await api(`/broadcasts/${id}/run`, { method: 'POST', body: {} }).catch(() => {});
+      pageBroadcastReport(id);
+    }, 2500);
+  }
+}
+
 // ---------- activity ----------
 const ACTION_BN = {
   'workspace.created': 'অ্যাকাউন্ট তৈরি', 'user.login': 'লগইন', 'user.added': 'সদস্য যোগ', 'user.updated': 'সদস্য আপডেট',
   'user.removed': 'সদস্য মুছে ফেলা', 'settings.updated': 'সেটিংস পরিবর্তন', 'conversation.assigned': 'চ্যাট অ্যাসাইন',
   'number.added': 'নাম্বার যোগ', 'number.updated': 'নাম্বার আপডেট', 'number.removed': 'নাম্বার মুছে ফেলা',
   'label.added': 'লেবেল যোগ', 'label.removed': 'লেবেল মুছে ফেলা',
+  'broadcast.created': 'ব্রডকাস্ট পাঠানো', 'broadcast.cancelled': 'ব্রডকাস্ট বাতিল',
 };
 async function pageActivity() {
   const rows = await api('/activity');

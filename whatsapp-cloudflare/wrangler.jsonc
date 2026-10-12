@@ -21,5 +21,6 @@
     "ALLOW_SIGNUP": "false",
     "GRAPH_API_VERSION": "v21.0"
   },
+  "triggers": { "crons": ["* * * * *"] },
   "observability": { "enabled": true }
 }

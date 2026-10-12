@@ -2,6 +2,7 @@
 import { ensureSchema, makeDb } from './db.js';
 import { handleApi } from './api.js';
 import { handleWebhook } from './webhook.js';
+import { processDue } from './broadcast.js';
 
 const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
@@ -25,5 +26,11 @@ export default {
     response = new Response(response.body, response);
     for (const [k, v] of Object.entries(SECURITY_HEADERS)) response.headers.set(k, v);
     return response;
+  },
+
+  // Every minute (see "triggers" in wrangler.jsonc): send the next batch of any due broadcast.
+  async scheduled(event, env, ctx) {
+    await ensureSchema(env);
+    ctx.waitUntil(processDue(env, makeDb(env)).catch((err) => console.error('broadcast cron failed', err)));
   },
 };

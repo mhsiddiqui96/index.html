@@ -2,11 +2,15 @@
 import { decrypt } from './crypto.js';
 
 export class WhatsAppError extends Error {
-  constructor(message, status) {
+  constructor(message, status, code) {
     super(message);
     this.status = status;
+    this.code = code; // Meta error code, e.g. 130429 = too many messages right now
   }
 }
+
+// Meta is asking us to slow down: try again later instead of marking the message failed.
+export const RATE_LIMIT_CODES = new Set([130429, 131048, 131056, 80007]);
 
 const base = (env) => env.GRAPH_BASE_URL || `https://graph.facebook.com/${env.GRAPH_API_VERSION || 'v21.0'}`;
 
@@ -30,7 +34,9 @@ async function graph(env, token, path, { method = 'GET', body } = {}) {
     let msg = err.error_user_msg || err.message || `Graph API error (${res.status})`;
     if (err.code === 190) msg = 'Access Token-এর মেয়াদ শেষ বা ভুল। সেটিংস থেকে নতুন টোকেন দিন।';
     if (err.code === 131030) msg = 'এই নাম্বারে পাঠানো যাবে না: টেস্ট নাম্বার ব্যবহার করলে Meta-তে প্রাপকের নাম্বারটি যোগ (allowed list) করুন।';
-    throw new WhatsAppError(msg, res.status);
+    if (err.code === 131047) msg = '২৪ ঘণ্টার বেশি আগে কথা হয়েছে — শুধু টেমপ্লেট পাঠানো যাবে।';
+    if (RATE_LIMIT_CODES.has(err.code)) msg = 'Meta-র পাঠানোর সীমা ছুঁয়েছে — একটু পরে আবার চেষ্টা হবে।';
+    throw new WhatsAppError(msg, res.status, err.code);
   }
   return data;
 }
@@ -47,9 +53,13 @@ async function send(env, db, ws, payload) {
 export const sendText = (env, db, ws, to, text) =>
   send(env, db, ws, { to, type: 'text', text: { preview_url: true, body: text } });
 
-export function sendTemplate(env, db, ws, to, name, language, params = []) {
+// header: optional { type: 'image' | 'document' | 'video', link } for templates whose header is media.
+export function sendTemplate(env, db, ws, to, name, language, params = [], header = null) {
   const template = { name, language: { code: language } };
-  if (params.length) template.components = [{ type: 'body', parameters: params.map((t) => ({ type: 'text', text: String(t) })) }];
+  const components = [];
+  if (header?.link) components.push({ type: 'header', parameters: [{ type: header.type, [header.type]: { link: header.link } }] });
+  if (params.length) components.push({ type: 'body', parameters: params.map((t) => ({ type: 'text', text: String(t) })) });
+  if (components.length) template.components = components;
   return send(env, db, ws, { to, type: 'template', template });
 }
 

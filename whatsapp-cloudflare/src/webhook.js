@@ -2,6 +2,7 @@
 import { decrypt, verifyMetaSignature } from './crypto.js';
 import { storeInbound, updateStatus, conversationView } from './inbox.js';
 import { notifyInbound } from './push.js';
+import { handleOptKeywords } from './broadcast.js';
 
 export async function handleWebhook(request, env, ctx, db) {
   const url = new URL(request.url);
@@ -22,7 +23,7 @@ export async function handleWebhook(request, env, ctx, db) {
   try { payload = JSON.parse(raw); } catch { return new Response('Bad request', { status: 400 }); }
   const signature = request.headers.get('x-hub-signature-256');
   // Acknowledge immediately (Meta retries slow webhooks); process in the background.
-  ctx.waitUntil(processPayload(db, payload, raw, signature, url.origin).catch((err) => console.error('webhook failed', err)));
+  ctx.waitUntil(processPayload(db, payload, raw, signature, url.origin, env).catch((err) => console.error('webhook failed', err)));
   return new Response('OK', { status: 200 });
 }
 
@@ -48,7 +49,7 @@ function extractBody(msg) {
   }
 }
 
-export async function processPayload(db, payload, raw, signature, origin) {
+export async function processPayload(db, payload, raw, signature, origin, env = {}) {
   const checked = new Map(); // number id -> signature ok (each number may belong to a different Meta app)
   for (const entry of payload.entry || []) {
     for (const change of entry.changes || []) {
@@ -73,6 +74,11 @@ export async function processPayload(db, payload, raw, signature, origin) {
         if (stored) {
           await notifyInbound(db, await conversationView(db, stored.convId), body || `[${msg.type}]`, origin)
             .catch((err) => console.error('push failed', err));
+          // "STOP" / "বন্ধ" turns broadcasts off for this contact, "START" back on.
+          if (msg.type === 'text') {
+            await handleOptKeywords(env, db, await db.first('SELECT * FROM numbers WHERE id = ?', num.id), msg.from, body)
+              .catch((err) => console.error('opt-out failed', err));
+          }
         }
       }
       for (const st of value.statuses || []) {
