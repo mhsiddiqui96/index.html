@@ -1,4 +1,4 @@
-# WA Business Desk: ফ্রি, কোনো সার্ভার ছাড়াই
+# WA Business SaaS: ফ্রি, কোনো সার্ভার ছাড়াই
 
 একটা WhatsApp নাম্বার এখন টিমের কয়েকজন মিলে চালাতে পারবেন। মালিক অ্যাডমিন বা এজেন্ট যোগ করবেন, আর সবাই নিজের ইমেইল ও পাসওয়ার্ড দিয়ে লগইন করে গ্রাহকদের উত্তর দেবেন। মোবাইল বা কম্পিউটার, যেকোনো ব্রাউজার থেকে চলবে।
 
@@ -14,13 +14,13 @@
 
 1. নিচের বাটনে ক্লিক করুন:
 
-   [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/mhsiddiqui96/index.html/tree/main/whatsapp-cloudflare)
+   [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/mhsiddiqui96/wa-business-saas/tree/main/whatsapp-cloudflare)
 
 2. Cloudflare-এ লগইন করুন। অ্যাকাউন্ট না থাকলে **Sign up** চেপে ইমেইল দিয়ে একটা খুলে নিন, এটা ফ্রি।
 3. পেজে আপনার GitHub অ্যাকাউন্ট কানেক্ট করতে বলবে। কানেক্ট করুন।
 4. বাকি সব ঘর যেমন আছে তেমনই রাখুন, তারপর নিচে **Create and deploy** চাপুন।
 5. ১-২ মিনিট অপেক্ষা করুন। কাজ শেষ হলে একটা লিংক পাবেন, দেখতে এরকম হবে:
-   `https://wa-business-desk.আপনার-নাম.workers.dev`
+   `https://wa-business-saas.আপনার-নাম.workers.dev`
    **এটাই আপনার অ্যাপ।** লিংকটা বুকমার্ক করে রাখুন।
 
 ## ধাপ ২: নিজের অ্যাকাউন্ট খুলুন
