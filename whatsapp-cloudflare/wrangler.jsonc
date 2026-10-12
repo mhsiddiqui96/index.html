@@ -12,8 +12,9 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "wa-business-saas-db",
-      "database_id": "00000000-0000-0000-0000-000000000000"
+      // No database_id: Wrangler creates the D1 database on the first deploy (and reuses it afterwards),
+      // whether deployed with the button, from the dashboard's Git connection, or by `wrangler deploy`.
+      "database_name": "wa-business-saas-db"
     }
   ],
   "vars": {
