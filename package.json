@@ -1,0 +1,11 @@
+{
+  "name": "wa-business-saas",
+  "private": true,
+  "description": "Pins Wrangler for Cloudflare Workers Builds that build this repo from its root (see wrangler.jsonc). The app lives in whatsapp-cloudflare/.",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "4.149.0"
+  }
+}
