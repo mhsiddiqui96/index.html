@@ -2,6 +2,7 @@ import { hashPassword, verifyPassword, encrypt, decrypt, randomToken, sha256Hex 
 import * as wa from './whatsapp.js';
 import * as inbox from './inbox.js';
 import { DEFAULT_LABELS } from './db.js';
+import * as bc from './broadcast.js';
 import { vapidKeys, notifyInbound, notifyUser } from './push.js';
 
 const ROLES = ['owner', 'admin', 'agent'];
@@ -472,6 +473,8 @@ async function route(request, env, ctx, db) {
     if (label) { where.push('EXISTS (SELECT 1 FROM conversation_labels cl WHERE cl.conversation_id = c.id AND cl.label_id = ?)'); params.push(label); }
     const q = str(url.searchParams.get('q') || '', 100);
     if (q) { where.push('(ct.name LIKE ? OR ct.wa_id LIKE ?)'); params.push(`%${q}%`, `%${q}%`); }
+    // Imported contacts nobody has talked to yet stay out of the inbox until filtered or searched for.
+    if (!label && !q) where.push('c.last_message_ms IS NOT NULL');
     return json(await inbox.conversationsWhere(db, where.join(' AND '), params));
   }
 
@@ -584,6 +587,128 @@ async function route(request, env, ctx, db) {
     return new Response(media.body, {
       headers: { 'Content-Type': media.mimeType || 'application/octet-stream', 'Cache-Control': 'private, max-age=86400' },
     });
+  }
+
+  // ---------- Contact import & broadcasts (owners/admins, on numbers they can access) ----------
+  const validLabelIds = async (ids) => {
+    const valid = new Set((await db.all('SELECT id FROM labels WHERE workspace_id = ?', wsId)).map((r) => r.id));
+    return [...new Set((Array.isArray(ids) ? ids : []).map(Number).filter((id) => valid.has(id)))];
+  };
+
+  if ((p = m('GET', '/numbers/(\\d+)/templates'))) {
+    const n = await loadNumber(p[0]);
+    const list = await wa.listTemplates(env, db, n);
+    return json(list.filter((t) => t.status === 'APPROVED'));
+  }
+
+  if (m('POST', '/contacts/import')) {
+    requireRole(user, MANAGERS);
+    const number = await loadNumber(body.number_id);
+    if (!Array.isArray(body.contacts) || !body.contacts.length) fail(400, 'কোনো নাম্বার পাওয়া যায়নি');
+    if (body.contacts.length > bc.IMPORT_CHUNK) fail(400, `একবারে সর্বোচ্চ ${bc.IMPORT_CHUNK}টি`);
+    const result = await bc.importContacts(db, {
+      workspaceId: wsId, numberId: number.id, labelIds: await validLabelIds(body.label_ids), contacts: body.contacts,
+    });
+    return json(result);
+  }
+
+  const audienceInput = async () => {
+    const number = await loadNumber(body.number_id);
+    const labelIds = await validLabelIds(body.label_ids);
+    if (!labelIds.length && body.everyone !== true) fail(400, 'কাদের পাঠাবেন — অন্তত একটি লেবেল বাছাই করুন');
+    const kind = body.kind === 'text' ? 'text' : 'template';
+    return { number, labelIds, kind };
+  };
+
+  if (m('POST', '/broadcasts/preview')) {
+    requireRole(user, MANAGERS);
+    const { number, labelIds, kind } = await audienceInput();
+    return json(await bc.previewAudience(db, { workspaceId: wsId, numberId: number.id, labelIds, kind, now: Date.now() }));
+  }
+
+  if (m('POST', '/broadcasts')) {
+    requireRole(user, MANAGERS);
+    const { number, labelIds, kind } = await audienceInput();
+    const name = str(body.name, 100) || 'ব্রডকাস্ট';
+    const now = Date.now();
+    const scheduled = Number(body.scheduled_ms) > now ? Number(body.scheduled_ms) : now;
+    let template = null;
+    let text;
+    if (kind === 'template') {
+      template = { name: str(body.template?.name, 512), language: str(body.template?.language, 20), category: str(body.template?.category, 30) };
+      if (!template.name || !template.language) fail(400, 'টেমপ্লেট বাছাই করুন');
+      text = str(body.body, 4096) || `[template: ${template.name}]`;
+    } else {
+      text = str(body.body, 4096);
+      if (!text) fail(400, 'মেসেজ লিখুন');
+    }
+    const params = (Array.isArray(body.params) ? body.params : []).slice(0, 20)
+      .map((x) => (x?.type === 'name' ? { type: 'name' } : { type: 'text', value: str(x?.value, 1000) }));
+    const headerType = ['image', 'document', 'video'].includes(body.header?.type) ? body.header.type : null;
+    const headerLink = str(body.header?.link, 1000);
+    if (headerType && !/^https:\/\//.test(headerLink)) fail(400, 'হেডারের জন্য https:// দিয়ে শুরু হওয়া একটি লিংক দিন');
+    const row = await db.first(`INSERT INTO broadcasts (workspace_id, number_id, created_by, name, kind, template_name, template_language,
+        template_category, body, params, header, name_fallback, audience, status, scheduled_ms, created_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?) RETURNING id`,
+    wsId, number.id, user.id, name, kind, template?.name, template?.language, template?.category, text, JSON.stringify(params),
+    headerType ? JSON.stringify({ type: headerType, link: headerLink }) : null, str(body.name_fallback, 60) || null,
+    JSON.stringify({ label_ids: labelIds, everyone: !labelIds.length }), scheduled, now);
+    await bc.createRecipients(db, row.id, { workspaceId: wsId, numberId: number.id, labelIds, kind, now });
+    const counts = await bc.report(db, row.id);
+    if (!counts.pending) await db.run("UPDATE broadcasts SET status = 'done', finished_ms = ? WHERE id = ?", now, row.id);
+    await db.log(wsId, user.id, 'broadcast.created', `${name}: ${counts.pending} জন`);
+    // Start right away (in the background) when it is not scheduled for later.
+    if (counts.pending && scheduled <= now) ctx.waitUntil(bc.processBroadcast(env, db, row.id).catch((err) => console.error('broadcast', err)));
+    return json({ id: row.id, ...counts }, 201);
+  }
+
+  const loadBroadcast = async (id) => {
+    const b = await db.first(`SELECT b.*, n.label AS number_label, u.name AS created_by_name FROM broadcasts b
+      JOIN numbers n ON n.id = b.number_id LEFT JOIN users u ON u.id = b.created_by
+      WHERE b.id = ? AND b.workspace_id = ?`, Number(id), wsId);
+    if (!b || !user.numberIds.includes(b.number_id)) fail(404, 'ব্রডকাস্ট পাওয়া যায়নি');
+    return b;
+  };
+
+  if (m('GET', '/broadcasts')) {
+    requireRole(user, MANAGERS);
+    const rows = await db.all(`SELECT b.id, b.name, b.kind, b.status, b.scheduled_ms, b.created_ms, b.number_id, n.label AS number_label,
+        (SELECT COUNT(*) FROM broadcast_recipients r WHERE r.broadcast_id = b.id AND r.status != 'skipped') AS total,
+        (SELECT COUNT(*) FROM broadcast_recipients r WHERE r.broadcast_id = b.id AND r.status = 'sent') AS sent,
+        (SELECT COUNT(*) FROM broadcast_recipients r WHERE r.broadcast_id = b.id AND r.status = 'failed') AS failed
+      FROM broadcasts b JOIN numbers n ON n.id = b.number_id WHERE b.workspace_id = ? ORDER BY b.id DESC LIMIT 100`, wsId);
+    return json(rows.filter((r) => user.numberIds.includes(r.number_id)));
+  }
+
+  if ((p = m('GET', '/broadcasts/(\\d+)'))) {
+    requireRole(user, MANAGERS);
+    const b = await loadBroadcast(p[0]);
+    const recipients = await db.all(`SELECT r.id, r.wa_id, r.name, r.status, r.error, r.sent_ms, r.conversation_id,
+        m.status AS message_status, (c.last_inbound_ms > r.sent_ms) AS replied
+      FROM broadcast_recipients r LEFT JOIN messages m ON m.wa_message_id = r.wa_message_id
+      LEFT JOIN conversations c ON c.id = r.conversation_id
+      WHERE r.broadcast_id = ? ORDER BY r.id LIMIT 2000`, b.id);
+    return json({ broadcast: { ...b, params: JSON.parse(b.params), audience: JSON.parse(b.audience) }, counts: await bc.report(db, b.id), recipients });
+  }
+
+  // An open report page calls this every few seconds to keep sending; the cron job does the same every minute.
+  if ((p = m('POST', '/broadcasts/(\\d+)/run'))) {
+    requireRole(user, MANAGERS);
+    const b = await loadBroadcast(p[0]);
+    await bc.processBroadcast(env, db, b.id);
+    return json(await bc.report(db, b.id));
+  }
+
+  if ((p = m('POST', '/broadcasts/(\\d+)/cancel'))) {
+    requireRole(user, MANAGERS);
+    const b = await loadBroadcast(p[0]);
+    if (!['scheduled', 'sending'].includes(b.status)) fail(400, 'এই ব্রডকাস্ট আর থামানো যাবে না');
+    await db.batch([
+      db.prep("UPDATE broadcasts SET status = 'cancelled', finished_ms = ? WHERE id = ?", Date.now(), b.id),
+      db.prep("UPDATE broadcast_recipients SET status = 'skipped', error = 'বাতিল করা হয়েছে' WHERE broadcast_id = ? AND status = 'pending'", b.id),
+    ]);
+    await db.log(wsId, user.id, 'broadcast.cancelled', b.name);
+    return json({ ok: true });
   }
 
   // ---------- Quick replies ----------

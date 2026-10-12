@@ -198,7 +198,47 @@ const MIGRATION_V2 = [
 ];
 
 export const DEFAULT_LABELS = [['নতুন লিড', '#2563eb'], ['ফলো-আপ', '#ea580c'], ['ভর্তি হয়েছে', '#16a34a'], ['পেমেন্ট বাকি', '#dc2626']];
-const MIGRATIONS = [[2, MIGRATION_V2]];
+// v3: broadcasts (mass messages to labelled contacts) and broadcast opt-out.
+const MIGRATION_V3 = [
+  `ALTER TABLE contacts ADD COLUMN opted_out INTEGER NOT NULL DEFAULT 0`,
+  `CREATE TABLE broadcasts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    number_id INTEGER NOT NULL REFERENCES numbers(id) ON DELETE CASCADE,
+    created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('template','text')),
+    template_name TEXT,
+    template_language TEXT,
+    template_category TEXT,
+    body TEXT NOT NULL,
+    params TEXT NOT NULL DEFAULT '[]',
+    header TEXT,
+    name_fallback TEXT,
+    audience TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('scheduled','sending','done','cancelled')),
+    scheduled_ms INTEGER NOT NULL,
+    started_ms INTEGER,
+    finished_ms INTEGER,
+    created_ms INTEGER NOT NULL
+  )`,
+  `CREATE INDEX idx_broadcasts_due ON broadcasts(status, scheduled_ms)`,
+  `CREATE TABLE broadcast_recipients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    broadcast_id INTEGER NOT NULL REFERENCES broadcasts(id) ON DELETE CASCADE,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    wa_id TEXT NOT NULL,
+    name TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending','sending','sent','failed','skipped')),
+    wa_message_id TEXT,
+    error TEXT,
+    claimed_ms INTEGER,
+    sent_ms INTEGER
+  )`,
+  `CREATE INDEX idx_bc_recipients ON broadcast_recipients(broadcast_id, status)`,
+];
+
+const MIGRATIONS = [[2, MIGRATION_V2], [3, MIGRATION_V3]];
 
 async function schemaVersion(env) {
   const row = await env.DB.prepare("SELECT value FROM meta WHERE key = 'schema_version'").first();
