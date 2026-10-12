@@ -79,7 +79,7 @@ function client() {
 const owner = client();
 const admin = client();
 const agent = client();
-let agentId, adminId, verifyToken, convId;
+let agentId, adminId, verifyToken, convId, numberId;
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function signedWebhook(payload, secret = 'app-secret') {
@@ -123,20 +123,26 @@ test('owner adds admin; admin adds agent but not admin', async () => {
   assert.equal(r.status, 201); agentId = r.data.id;
   assert.equal((await admin('POST', '/api/users', { name: 'A2', email: 'a2@x.com', role: 'admin', password: 'password1' })).status, 403);
   assert.equal((await agent('POST', '/api/login', { email: 'agent@x.com', password: 'password1' })).status, 200);
-  assert.equal((await agent('GET', '/api/settings')).status, 403);
+  assert.equal((await agent('PUT', '/api/workspace', { name: 'x' })).status, 403);
 });
 
-test('settings encrypt secrets and expose webhook details', async () => {
-  let r = await owner('PUT', '/api/settings', { name: 'Demo Biz', wa_phone_number_id: '111222', wa_business_account_id: '999', wa_access_token: 'EAAGsecrettoken1234', wa_app_secret: 'app-secret' });
+test('number settings encrypt secrets and expose webhook details', async () => {
+  const me = (await owner('GET', '/api/me')).data;
+  assert.equal(me.numbers.length, 1);
+  assert.equal(me.numbers[0].label, 'প্রধান নাম্বার');
+  numberId = me.numbers[0].id;
+  let r = await owner('PUT', `/api/numbers/${numberId}`, { label: 'ভর্তি', wa_phone_number_id: '111222', wa_business_account_id: '999', wa_access_token: 'EAAGsecrettoken1234', wa_app_secret: 'app-secret' });
   assert.equal(r.status, 200);
-  r = await owner('GET', '/api/settings');
+  assert.equal((await agent('GET', `/api/numbers/${numberId}`)).status, 403);
+  r = await owner('GET', `/api/numbers/${numberId}`);
+  assert.equal(r.data.label, 'ভর্তি');
   assert.equal(r.data.token_hint, '••••1234');
   assert.equal(r.data.app_secret_set, true);
   assert.equal(r.data.webhook_url, base + '/webhook');
   assert.ok(r.data.verify_token.length > 10);
   assert.ok(!JSON.stringify(r.data).includes('EAAGsecret'));
   verifyToken = r.data.verify_token;
-  r = await owner('POST', '/api/settings/test', {});
+  r = await owner('POST', `/api/numbers/${numberId}/test`, {});
   assert.equal(r.data.verified_name, 'Test Biz');
   assert.equal((await owner('GET', '/api/me')).data.workspace.connected, true);
 });
@@ -206,7 +212,7 @@ test('new chat outside 24h window needs a template', async () => {
   assert.equal(r.data.window_open, false);
   const id = r.data.id;
   assert.equal((await owner('POST', `/api/conversations/${id}/messages`, { text: 'hi' })).status, 400);
-  assert.equal((await owner('GET', '/api/templates')).data[0].name, 'hello');
+  assert.equal((await owner('GET', `/api/conversations/${id}/templates`)).data[0].name, 'hello');
   r = await owner('POST', `/api/conversations/${id}/template`, { name: 'hello', language: 'bn', params: ['Karim'], preview: 'Hi Karim' });
   assert.equal(r.status, 201);
   assert.deepEqual(graphCalls.find((c) => c.body?.type === 'template').body.template.components[0].parameters, [{ type: 'text', text: 'Karim' }]);
@@ -296,6 +302,81 @@ test('push: VAPID-signed, encrypted notifications reach every allowed team membe
   assert.equal((await admin('POST', '/api/push/test', {})).data.devices, 1);
   await admin('POST', '/api/push/unsubscribe', { endpoint: devices.admin.sub.endpoint });
   assert.equal((await admin('POST', '/api/push/test', {})).status, 400);
+});
+
+test('labels: anyone creates, managers edit/delete; chats can be tagged, filtered and annotated', async () => {
+  const defaults = (await owner('GET', '/api/labels')).data;
+  assert.deepEqual(defaults.map((l) => l.name), ['নতুন লিড', 'ফলো-আপ', 'ভর্তি হয়েছে', 'পেমেন্ট বাকি']);
+  const created = await agent('POST', '/api/labels', { name: 'ক্লাস ৫', color: '#123ABC' });
+  assert.equal(created.status, 201);
+  assert.equal(created.data.color, '#123abc');
+  assert.equal((await agent('POST', '/api/labels', { name: 'ক্লাস ৫' })).status, 400);
+  assert.equal((await agent('DELETE', `/api/labels/${created.data.id}`, {})).status, 403);
+
+  const lead = defaults[0].id;
+  let r = await owner('PUT', `/api/conversations/${convId}/labels`, { label_ids: [lead, created.data.id, 99999] });
+  assert.deepEqual(r.data.label_ids.sort(), [lead, created.data.id].sort());
+  assert.deepEqual((await owner('GET', `/api/conversations?label=${lead}&status=`)).data.map((c) => c.id), [convId]);
+  assert.equal((await owner('GET', '/api/labels')).data.find((l) => l.id === lead).count, 1);
+
+  assert.equal((await owner('POST', `/api/conversations/${convId}/notes`, { body: 'বাবা ফোন করবেন' })).status, 201);
+  const notes = (await admin('GET', `/api/conversations/${convId}/notes`)).data;
+  assert.equal(notes[0].body, 'বাবা ফোন করবেন');
+  assert.equal(notes[0].user_name, 'Owner');
+  assert.equal((await owner('GET', `/api/conversations/${convId}/messages`)).data.conversation.note_count, 1);
+  assert.equal((await admin('DELETE', `/api/notes/${notes[0].id}`, {})).status, 200);
+
+  assert.equal((await owner('PATCH', `/api/labels/${lead}`, { name: 'লিড', color: '#000000' })).status, 200);
+  assert.equal((await owner('DELETE', `/api/labels/${created.data.id}`, {})).status, 200);
+  r = await owner('GET', `/api/conversations/${convId}/messages`);
+  assert.deepEqual(r.data.conversation.label_ids, [lead]);
+});
+
+test('several numbers, each with its own team', async () => {
+  let r = await owner('POST', '/api/numbers', { label: 'হিফজ বিভাগ' });
+  assert.equal(r.status, 201);
+  const n2 = r.data.id;
+  await owner('PUT', `/api/numbers/${n2}`, { wa_phone_number_id: '333444', wa_access_token: 'EAAGsecond5678', wa_app_secret: 'second-secret' });
+  assert.equal((await owner('PUT', `/api/numbers/${n2}`, { wa_phone_number_id: '111222' })).status, 400);
+  // Admin and agent were created before this number existed: they cannot see it.
+  assert.deepEqual((await admin('GET', '/api/numbers')).data.map((n) => n.id), [numberId]);
+
+  const before = pushesTo('owner').length;
+  const payload = inbound('wamid.n2.1', 'হিফজে ভর্তি', '8801711111111');
+  payload.entry[0].changes[0].value.metadata.phone_number_id = '333444';
+  await signedWebhook(payload, 'second-secret');
+  await wait(800);
+  // Same customer, different number = separate chat.
+  const all = (await owner('GET', '/api/conversations?status=')).data;
+  const conv2 = all.find((c) => c.number_id === n2);
+  assert.equal(conv2.number_label, 'হিফজ বিভাগ');
+  assert.notEqual(conv2.id, convId);
+  assert.equal(pushesTo('owner').length, before + 1);
+  assert.ok(!(await admin('GET', '/api/conversations?status=')).data.some((c) => c.id === conv2.id));
+  assert.equal((await admin('GET', `/api/conversations/${conv2.id}/messages`)).status, 403);
+  assert.deepEqual((await owner('GET', `/api/conversations?number=${n2}&status=`)).data.map((c) => c.id), [conv2.id]);
+
+  // Reply goes out from the second number.
+  r = await owner('POST', `/api/conversations/${conv2.id}/messages`, { text: 'জি' });
+  assert.equal(r.status, 201);
+  assert.match(graphCalls.at(-1).url, /\/333444\/messages$/);
+
+  // Cannot assign to someone without access to that number; after granting, admin sees it.
+  assert.equal((await owner('PATCH', `/api/conversations/${conv2.id}`, { assigned_to: adminId })).status, 400);
+  assert.equal((await owner('PATCH', `/api/users/${adminId}`, { number_ids: [numberId, n2] })).status, 200);
+  assert.ok((await admin('GET', '/api/conversations?status=')).data.some((c) => c.id === conv2.id));
+  assert.equal((await owner('PATCH', `/api/conversations/${conv2.id}`, { assigned_to: adminId })).status, 200);
+  // Admin can only grant numbers they have: give the agent n2 too.
+  assert.equal((await admin('PATCH', `/api/users/${agentId}`, { number_ids: [n2] })).status, 200);
+  const team = (await owner('GET', '/api/users')).data;
+  assert.deepEqual(team.find((u) => u.id === agentId).number_ids, [n2]);
+
+  // Only the owner deletes a number; its chats go with it.
+  assert.equal((await admin('DELETE', `/api/numbers/${n2}`, {})).status, 403);
+  assert.equal((await owner('DELETE', `/api/numbers/${n2}`, {})).status, 200);
+  assert.equal((await owner('GET', `/api/conversations/${conv2.id}/messages`)).status, 404);
+  assert.equal((await owner('DELETE', `/api/numbers/${numberId}`, {})).status, 400);
+  await owner('PATCH', `/api/users/${agentId}`, { number_ids: [numberId] });
 });
 
 test('deactivated user is logged out', async () => {

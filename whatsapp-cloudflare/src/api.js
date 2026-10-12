@@ -1,6 +1,7 @@
 import { hashPassword, verifyPassword, encrypt, decrypt, randomToken, sha256Hex } from './crypto.js';
 import * as wa from './whatsapp.js';
 import * as inbox from './inbox.js';
+import { DEFAULT_LABELS } from './db.js';
 import { vapidKeys, notifyInbound, notifyUser } from './push.js';
 
 const ROLES = ['owner', 'admin', 'agent'];
@@ -117,6 +118,12 @@ async function route(request, env, ctx, db) {
     const user = await db.first(
       'INSERT INTO users (workspace_id, name, email, password_hash, role, created_ms) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
       ws.id, name, email, await hashPassword(password), 'owner', now);
+    // Every workspace starts with one (not yet connected) number and a few starter labels.
+    await db.batch([
+      db.prep('INSERT INTO numbers (workspace_id, label, created_ms) VALUES (?, ?, ?)', ws.id, 'প্রধান নাম্বার', now),
+      ...DEFAULT_LABELS.map(([label, color]) =>
+        db.prep('INSERT INTO labels (workspace_id, name, color, created_ms) VALUES (?, ?, ?, ?)', ws.id, label, color, now)),
+    ]);
     await db.log(ws.id, user.id, 'workspace.created', workspaceName);
     return json({ ok: true }, 201, { 'Set-Cookie': await createSession(db, request, user.id) });
   }
@@ -140,18 +147,55 @@ async function route(request, env, ctx, db) {
   const user = await currentUser(db, request);
   if (!user) fail(401, 'লগইন করুন');
   const wsId = user.workspace_id;
+  // Owners see every number; others only the numbers they were given.
+  user.numberIds = user.role === 'owner'
+    ? (await db.all('SELECT id FROM numbers WHERE workspace_id = ?', wsId)).map((r) => r.id)
+    : (await db.all('SELECT number_id FROM number_access WHERE user_id = ?', user.id)).map((r) => r.number_id);
   const workspace = () => db.first('SELECT * FROM workspaces WHERE id = ?', wsId);
+  const [scopeSql, scopeParams] = inbox.numberScope(user);
 
   async function loadConversation(id) {
     const conv = await inbox.conversationView(db, Number(id));
     if (!conv || conv.workspace_id !== wsId) fail(404, 'কথোপকথন পাওয়া যায়নি');
-    if (!inbox.canAccess(user, conv)) fail(403, 'এই চ্যাটটি অন্য এজেন্টকে দেওয়া আছে');
+    if (!inbox.canAccess(user, conv)) fail(403, 'এই চ্যাটটি দেখার অনুমতি আপনার নেই');
     return conv;
+  }
+
+  async function loadNumber(id, { manage = false } = {}) {
+    const number = await db.first('SELECT * FROM numbers WHERE id = ? AND workspace_id = ?', Number(id), wsId);
+    if (!number) fail(404, 'নাম্বার পাওয়া যায়নি');
+    if (!user.numberIds.includes(number.id)) fail(403, 'এই নাম্বারের অনুমতি আপনার নেই');
+    if (manage) requireRole(user, MANAGERS);
+    return number;
+  }
+  const numberOf = (conv) => db.first('SELECT * FROM numbers WHERE id = ?', conv.number_id);
+  const publicNumber = (n) => ({
+    id: n.id, label: n.label, display_phone: n.wa_display_phone || '',
+    connected: !!(n.wa_phone_number_id && n.wa_access_token),
+  });
+  const myNumbers = async () => (await db.all('SELECT * FROM numbers WHERE workspace_id = ? ORDER BY id', wsId))
+    .filter((n) => user.numberIds.includes(n.id));
+
+  // Grants `requested` numbers to a user. Admins can only grant or revoke numbers they have themselves;
+  // the target keeps any other numbers it already had.
+  async function setUserNumbers(targetId, requested) {
+    if (!Array.isArray(requested)) return;
+    const valid = new Set((await db.all('SELECT id FROM numbers WHERE workspace_id = ?', wsId)).map((r) => r.id));
+    const mine = new Set(user.numberIds);
+    const wanted = requested.map(Number).filter((id) => valid.has(id) && mine.has(id));
+    const current = (await db.all('SELECT number_id FROM number_access WHERE user_id = ?', targetId)).map((r) => r.number_id);
+    const keep = current.filter((id) => !mine.has(id));
+    const next = [...new Set([...keep, ...wanted])];
+    await db.batch([
+      db.prep('DELETE FROM number_access WHERE user_id = ?', targetId),
+      ...next.map((id) => db.prep('INSERT INTO number_access (number_id, user_id) VALUES (?, ?)', id, targetId)),
+    ]);
   }
 
   if (m('GET', '/me')) {
     const ws = await workspace();
-    return json({ user, workspace: { id: ws.id, name: ws.name, connected: !!(ws.wa_phone_number_id && ws.wa_access_token), display_phone: ws.wa_display_phone } });
+    const numbers = (await myNumbers()).map(publicNumber);
+    return json({ user, workspace: { id: ws.id, name: ws.name, connected: numbers.some((n) => n.connected) }, numbers });
   }
 
   if (m('POST', '/me/password')) {
@@ -162,18 +206,27 @@ async function route(request, env, ctx, db) {
     return json({ ok: true });
   }
 
+  if (m('PUT', '/workspace')) {
+    requireRole(user, MANAGERS);
+    const name = str(body.name, 120);
+    if (!name) fail(400, 'বিজনেসের নাম দিন');
+    await db.run('UPDATE workspaces SET name = ? WHERE id = ?', name, wsId);
+    return json({ ok: true });
+  }
+
   // ---------- Live updates (polled by the browser every few seconds) ----------
   if (m('GET', '/updates')) {
     // No `since` (first poll): start from now and return nothing.
     const since = url.searchParams.has('since') ? Number(url.searchParams.get('since')) || 0 : Date.now();
     const convId = Number(url.searchParams.get('conv')) || 0;
     const now = Date.now();
-    const visible = user.role === 'agent' ? ' AND (c.assigned_to IS NULL OR c.assigned_to = ?)' : '';
-    const conversations = await inbox.conversationsWhere(db, `c.workspace_id = ? AND c.updated_ms > ?${visible}`,
-      user.role === 'agent' ? [wsId, since, user.id] : [wsId, since], 200);
+    const agentOnly = user.role === 'agent' ? ' AND (c.assigned_to IS NULL OR c.assigned_to = ?)' : '';
+    const conversations = await inbox.conversationsWhere(db,
+      `c.workspace_id = ? AND c.updated_ms > ? AND ${scopeSql}${agentOnly}`,
+      [wsId, since, ...scopeParams, ...(user.role === 'agent' ? [user.id] : [])], 200);
     const hidden = user.role === 'agent'
-      ? (await db.all('SELECT id FROM conversations WHERE workspace_id = ? AND updated_ms > ? AND assigned_to IS NOT NULL AND assigned_to != ?',
-        wsId, since, user.id)).map((r) => r.id)
+      ? (await db.all(`SELECT c.id FROM conversations c WHERE c.workspace_id = ? AND c.updated_ms > ? AND ${scopeSql}
+          AND c.assigned_to IS NOT NULL AND c.assigned_to != ?`, wsId, since, ...scopeParams, user.id)).map((r) => r.id)
       : [];
     let messages = [];
     if (convId && !hidden.includes(convId)) {
@@ -187,8 +240,11 @@ async function route(request, env, ctx, db) {
 
   // ---------- Team ----------
   if (m('GET', '/users')) {
-    return json(await db.all(`SELECT id, name, email, role, active, last_login_ms, created_ms FROM users WHERE workspace_id = ?
-      ORDER BY CASE role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, name`, wsId));
+    return json(await db.all(`SELECT u.id, u.name, u.email, u.role, u.active, u.last_login_ms, u.created_ms,
+        (SELECT json_group_array(na.number_id) FROM number_access na WHERE na.user_id = u.id) AS number_ids
+      FROM users u WHERE u.workspace_id = ?
+      ORDER BY CASE u.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, u.name`, wsId)
+      .then((rows) => rows.map((r) => ({ ...r, number_ids: JSON.parse(r.number_ids || '[]') }))));
   }
 
   if (m('POST', '/users')) {
@@ -204,6 +260,8 @@ async function route(request, env, ctx, db) {
     const row = await db.first(
       'INSERT INTO users (workspace_id, name, email, password_hash, role, created_ms) VALUES (?, ?, ?, ?, ?, ?) RETURNING id',
       wsId, name, email, await hashPassword(body.password), role, Date.now());
+    // Default: every number the person adding them can see.
+    await setUserNumbers(row.id, Array.isArray(body.number_ids) ? body.number_ids : user.numberIds);
     await db.log(wsId, user.id, 'user.added', `${name} <${email}> (${role})`);
     return json({ id: row.id }, 201);
   }
@@ -242,63 +300,176 @@ async function route(request, env, ctx, db) {
       await db.run('DELETE FROM sessions WHERE user_id = ?', target.id);
       changes.push('password reset');
     }
+    if (body.number_ids !== undefined) {
+      await setUserNumbers(target.id, body.number_ids);
+      changes.push('numbers');
+    }
     await db.log(wsId, user.id, 'user.updated', `${target.email}: ${changes.join(', ')}`);
     return json({ ok: true });
   }
 
-  // ---------- WhatsApp settings ----------
-  if (m('GET', '/settings')) {
+  // ---------- WhatsApp numbers ----------
+  if (m('GET', '/numbers')) return json((await myNumbers()).map(publicNumber));
+
+  if (m('POST', '/numbers')) {
     requireRole(user, MANAGERS);
-    const ws = await workspace();
-    const token = await decrypt(db, ws.wa_access_token);
+    const label = str(body.label, 60);
+    if (!label) fail(400, 'নাম্বারের একটি নাম দিন (যেমন: ভর্তি বিভাগ)');
+    const row = await db.first('INSERT INTO numbers (workspace_id, label, created_ms) VALUES (?, ?, ?) RETURNING id', wsId, label, Date.now());
+    if (user.role !== 'owner') await db.run('INSERT INTO number_access (number_id, user_id) VALUES (?, ?)', row.id, user.id);
+    await db.log(wsId, user.id, 'number.added', label);
+    return json({ id: row.id }, 201);
+  }
+
+  if ((p = m('GET', '/numbers/(\\d+)'))) {
+    const n = await loadNumber(p[0], { manage: true });
+    const token = await decrypt(db, n.wa_access_token);
     return json({
-      name: ws.name,
-      wa_phone_number_id: ws.wa_phone_number_id || '',
-      wa_business_account_id: ws.wa_business_account_id || '',
-      wa_display_phone: ws.wa_display_phone || '',
+      ...publicNumber(n),
+      wa_phone_number_id: n.wa_phone_number_id || '',
+      wa_business_account_id: n.wa_business_account_id || '',
       token_set: !!token,
       token_hint: token ? `••••${token.slice(-4)}` : '',
-      app_secret_set: !!ws.wa_app_secret,
+      app_secret_set: !!n.wa_app_secret,
       webhook_url: `${url.origin}/webhook`,
-      verify_token: ws.wa_verify_token,
+      verify_token: (await workspace()).wa_verify_token,
     });
   }
 
-  if (m('PUT', '/settings')) {
-    requireRole(user, MANAGERS);
-    const ws = await workspace();
-    const name = str(body.name, 120) || ws.name;
+  if ((p = m('PUT', '/numbers/(\\d+)'))) {
+    const n = await loadNumber(p[0], { manage: true });
+    const label = str(body.label, 60) || n.label;
     const phoneId = phoneDigits(str(body.wa_phone_number_id, 40)) || null;
     const wabaId = phoneDigits(str(body.wa_business_account_id, 40)) || null;
     const token = str(body.wa_access_token, 2000);
     const appSecret = str(body.wa_app_secret, 200);
-    if (phoneId && await db.first('SELECT 1 FROM workspaces WHERE wa_phone_number_id = ? AND id != ?', phoneId, wsId)) {
-      fail(400, 'এই Phone Number ID অন্য একটি অ্যাকাউন্টে যুক্ত আছে');
+    if (phoneId && await db.first('SELECT 1 FROM numbers WHERE wa_phone_number_id = ? AND id != ?', phoneId, n.id)) {
+      fail(400, 'এই Phone Number ID আগেই অন্য একটি নাম্বারে যুক্ত আছে');
     }
-    await db.run(`UPDATE workspaces SET name = ?, wa_phone_number_id = ?, wa_business_account_id = ?,
+    await db.run(`UPDATE numbers SET label = ?, wa_phone_number_id = ?, wa_business_account_id = ?,
         wa_access_token = COALESCE(?, wa_access_token), wa_app_secret = COALESCE(?, wa_app_secret) WHERE id = ?`,
-    name, phoneId, wabaId, token ? await encrypt(db, token) : null, appSecret ? await encrypt(db, appSecret) : null, wsId);
-    await db.log(wsId, user.id, 'settings.updated', [token && 'access token', appSecret && 'app secret'].filter(Boolean).join(', ') || null);
+    label, phoneId, wabaId, token ? await encrypt(db, token) : null, appSecret ? await encrypt(db, appSecret) : null, n.id);
+    await db.log(wsId, user.id, 'number.updated', [label, token && 'access token', appSecret && 'app secret'].filter(Boolean).join(', '));
     return json({ ok: true });
   }
 
-  if (m('POST', '/settings/test')) {
-    requireRole(user, MANAGERS);
-    const info = await wa.getPhoneInfo(env, db, await workspace());
-    await db.run('UPDATE workspaces SET wa_display_phone = ? WHERE id = ?', info.display_phone_number || null, wsId);
+  if ((p = m('POST', '/numbers/(\\d+)/test'))) {
+    const n = await loadNumber(p[0], { manage: true });
+    const info = await wa.getPhoneInfo(env, db, n);
+    await db.run('UPDATE numbers SET wa_display_phone = ? WHERE id = ?', info.display_phone_number || null, n.id);
     return json(info);
+  }
+
+  if ((p = m('DELETE', '/numbers/(\\d+)'))) {
+    requireRole(user, ['owner']);
+    const n = await loadNumber(p[0]);
+    if ((await db.first('SELECT COUNT(*) AS c FROM numbers WHERE workspace_id = ?', wsId)).c <= 1) fail(400, 'অন্তত একটি নাম্বার থাকতে হবে');
+    await db.run('DELETE FROM numbers WHERE id = ?', n.id); // its chats and messages go with it
+    await db.log(wsId, user.id, 'number.removed', n.label);
+    return json({ ok: true });
+  }
+
+  // ---------- Labels & notes ----------
+  if (m('GET', '/labels')) {
+    return json(await db.all(`SELECT l.id, l.name, l.color,
+        (SELECT COUNT(*) FROM conversation_labels cl JOIN conversations c ON c.id = cl.conversation_id
+         WHERE cl.label_id = l.id AND ${scopeSql}) AS count
+      FROM labels l WHERE l.workspace_id = ? ORDER BY l.id`, ...scopeParams, wsId));
+  }
+
+  const labelInput = () => {
+    const name = str(body.name, 40);
+    const color = /^#[0-9a-f]{6}$/i.test(body.color || '') ? body.color.toLowerCase() : '#6b7280';
+    if (!name) fail(400, 'লেবেলের নাম দিন');
+    return { name, color };
+  };
+
+  // Anyone on the team can create a label on the spot; renaming and deleting is for owners/admins.
+  if (m('POST', '/labels')) {
+    const { name, color } = labelInput();
+    if (await db.first('SELECT 1 FROM labels WHERE workspace_id = ? AND name = ?', wsId, name)) fail(400, 'এই নামে লেবেল আগেই আছে');
+    const row = await db.first('INSERT INTO labels (workspace_id, name, color, created_ms) VALUES (?, ?, ?, ?) RETURNING id, name, color',
+      wsId, name, color, Date.now());
+    await db.log(wsId, user.id, 'label.added', name);
+    return json(row, 201);
+  }
+
+  if ((p = m('PATCH', '/labels/(\\d+)')) || (p = m('DELETE', '/labels/(\\d+)'))) {
+    requireRole(user, MANAGERS);
+    const label = await db.first('SELECT * FROM labels WHERE id = ? AND workspace_id = ?', Number(p[0]), wsId);
+    if (!label) fail(404, 'লেবেল পাওয়া যায়নি');
+    // Touch the affected chats so every open screen refreshes their labels.
+    const touch = db.prep(`UPDATE conversations SET updated_ms = ? WHERE id IN
+      (SELECT conversation_id FROM conversation_labels WHERE label_id = ?)`, Date.now(), label.id);
+    if (method === 'DELETE') {
+      await db.batch([touch, db.prep('DELETE FROM labels WHERE id = ?', label.id)]);
+      await db.log(wsId, user.id, 'label.removed', label.name);
+      return json({ ok: true });
+    }
+    const { name, color } = labelInput();
+    if (name !== label.name && await db.first('SELECT 1 FROM labels WHERE workspace_id = ? AND name = ?', wsId, name)) {
+      fail(400, 'এই নামে লেবেল আগেই আছে');
+    }
+    await db.batch([touch, db.prep('UPDATE labels SET name = ?, color = ? WHERE id = ?', name, color, label.id)]);
+    return json({ ok: true });
+  }
+
+  if ((p = m('PUT', '/conversations/(\\d+)/labels'))) {
+    const conv = await loadConversation(p[0]);
+    const valid = new Set((await db.all('SELECT id FROM labels WHERE workspace_id = ?', wsId)).map((r) => r.id));
+    const ids = [...new Set((Array.isArray(body.label_ids) ? body.label_ids : []).map(Number).filter((id) => valid.has(id)))];
+    await db.batch([
+      db.prep('DELETE FROM conversation_labels WHERE conversation_id = ?', conv.id),
+      ...ids.map((id) => db.prep('INSERT INTO conversation_labels (conversation_id, label_id) VALUES (?, ?)', conv.id, id)),
+      db.prep('UPDATE conversations SET updated_ms = ? WHERE id = ?', Date.now(), conv.id),
+    ]);
+    return json(await inbox.conversationView(db, conv.id));
+  }
+
+  if ((p = m('GET', '/conversations/(\\d+)/notes'))) {
+    const conv = await loadConversation(p[0]);
+    return json(await db.all(`SELECT n.id, n.body, n.created_ms, n.user_id, u.name AS user_name FROM notes n
+      LEFT JOIN users u ON u.id = n.user_id WHERE n.conversation_id = ? ORDER BY n.id DESC`, conv.id));
+  }
+
+  if ((p = m('POST', '/conversations/(\\d+)/notes'))) {
+    const conv = await loadConversation(p[0]);
+    const text = str(body.body, 2000);
+    if (!text) fail(400, 'নোট লিখুন');
+    const now = Date.now();
+    await db.batch([
+      db.prep('INSERT INTO notes (conversation_id, user_id, body, created_ms) VALUES (?, ?, ?, ?)', conv.id, user.id, text, now),
+      db.prep('UPDATE conversations SET updated_ms = ? WHERE id = ?', now, conv.id),
+    ]);
+    return json({ ok: true }, 201);
+  }
+
+  if ((p = m('DELETE', '/notes/(\\d+)'))) {
+    const note = await db.first('SELECT * FROM notes WHERE id = ?', Number(p[0]));
+    if (!note) fail(404, 'নোট পাওয়া যায়নি');
+    await loadConversation(note.conversation_id);
+    if (note.user_id !== user.id && !MANAGERS.includes(user.role)) fail(403, 'শুধু নিজের নোট মুছতে পারবেন');
+    await db.batch([
+      db.prep('DELETE FROM notes WHERE id = ?', note.id),
+      db.prep('UPDATE conversations SET updated_ms = ? WHERE id = ?', Date.now(), note.conversation_id),
+    ]);
+    return json({ ok: true });
   }
 
   // ---------- Inbox ----------
   if (m('GET', '/conversations')) {
-    const where = ['c.workspace_id = ?'];
-    const params = [wsId];
+    const where = ['c.workspace_id = ?', scopeSql];
+    const params = [wsId, ...scopeParams];
     if (user.role === 'agent') { where.push('(c.assigned_to IS NULL OR c.assigned_to = ?)'); params.push(user.id); }
     const status = url.searchParams.get('status');
     if (['open', 'closed'].includes(status)) { where.push('c.status = ?'); params.push(status); }
     const filter = url.searchParams.get('filter');
     if (filter === 'mine') { where.push('c.assigned_to = ?'); params.push(user.id); }
     if (filter === 'unassigned') where.push('c.assigned_to IS NULL');
+    const number = Number(url.searchParams.get('number'));
+    if (number) { where.push('c.number_id = ?'); params.push(number); }
+    const label = Number(url.searchParams.get('label'));
+    if (label) { where.push('EXISTS (SELECT 1 FROM conversation_labels cl WHERE cl.conversation_id = c.id AND cl.label_id = ?)'); params.push(label); }
     const q = str(url.searchParams.get('q') || '', 100);
     if (q) { where.push('(ct.name LIKE ? OR ct.wa_id LIKE ?)'); params.push(`%${q}%`, `%${q}%`); }
     return json(await inbox.conversationsWhere(db, where.join(' AND '), params));
@@ -307,7 +478,8 @@ async function route(request, env, ctx, db) {
   if (m('POST', '/conversations')) {
     const waId = phoneDigits(body.phone);
     if (waId.length < 8 || waId.length > 15) fail(400, 'দেশের কোডসহ সঠিক নাম্বার দিন (যেমন 8801XXXXXXXXX)');
-    const convId = await inbox.upsertConversation(db, wsId, waId, str(body.name, 120) || null);
+    const number = await loadNumber(body.number_id || user.numberIds[0] || 0);
+    const convId = await inbox.upsertConversation(db, wsId, number.id, waId, str(body.name, 120) || null);
     const conv = await inbox.conversationView(db, convId);
     if (!inbox.canAccess(user, conv)) fail(403, 'এই চ্যাটটি অন্য এজেন্টকে দেওয়া আছে');
     if (user.role === 'agent' && conv.assigned_to == null) {
@@ -330,7 +502,7 @@ async function route(request, env, ctx, db) {
       // Blue ticks for the customer (best effort, in the background).
       const last = await db.first(`SELECT wa_message_id FROM messages WHERE conversation_id = ? AND direction = 'in'
         AND wa_message_id IS NOT NULL ORDER BY id DESC LIMIT 1`, conv.id);
-      if (last) ctx.waitUntil(workspace().then((ws) => wa.markRead(env, db, ws, last.wa_message_id)).catch(() => {}));
+      if (last) ctx.waitUntil(numberOf(conv).then((n) => wa.markRead(env, db, n, last.wa_message_id)).catch(() => {}));
     }
     return json({ ok: true });
   }
@@ -347,8 +519,12 @@ async function route(request, env, ctx, db) {
       if (user.role === 'agent' && assignee !== user.id && !(assignee === null && conv.assigned_to === user.id)) {
         fail(403, 'এজেন্ট শুধু নিজেকে চ্যাট অ্যাসাইন করতে পারবে');
       }
-      if (assignee !== null && !(await db.first('SELECT 1 FROM users WHERE id = ? AND workspace_id = ? AND active = 1', assignee, wsId))) {
-        fail(400, 'সদস্য পাওয়া যায়নি');
+      if (assignee !== null) {
+        const target = await db.first('SELECT id, role FROM users WHERE id = ? AND workspace_id = ? AND active = 1', assignee, wsId);
+        if (!target) fail(400, 'সদস্য পাওয়া যায়নি');
+        if (target.role !== 'owner' && !(await db.first('SELECT 1 FROM number_access WHERE number_id = ? AND user_id = ?', conv.number_id, target.id))) {
+          fail(400, 'এই সদস্যের এই নাম্বারের অনুমতি নেই');
+        }
       }
       await db.run('UPDATE conversations SET assigned_to = ?, updated_ms = ? WHERE id = ?', assignee, now, conv.id);
       await db.log(wsId, user.id, 'conversation.assigned', `+${conv.wa_id} → ${assignee ?? 'unassigned'}`);
@@ -356,7 +532,7 @@ async function route(request, env, ctx, db) {
     if (body.contact_name !== undefined) {
       await db.batch([
         db.prep('UPDATE contacts SET name = ? WHERE id = ?', str(body.contact_name, 120) || null, conv.contact_id),
-        db.prep('UPDATE conversations SET updated_ms = ? WHERE id = ?', now, conv.id),
+        db.prep('UPDATE conversations SET updated_ms = ? WHERE contact_id = ?', now, conv.contact_id),
       ]);
     }
     return json(await inbox.conversationView(db, conv.id));
@@ -364,7 +540,7 @@ async function route(request, env, ctx, db) {
 
   async function sendAndStore(conv, type, text, sender) {
     try {
-      const waMessageId = await sender(await workspace());
+      const waMessageId = await sender(await numberOf(conv));
       return json(await inbox.storeOutbound(db, conv, { type, body: text, waMessageId, status: 'sent', userId: user.id }), 201);
     } catch (err) {
       if (!(err instanceof wa.WhatsAppError)) throw err;
@@ -381,7 +557,7 @@ async function route(request, env, ctx, db) {
     if (user.role === 'agent' && conv.assigned_to == null) {
       await db.run('UPDATE conversations SET assigned_to = ? WHERE id = ?', user.id, conv.id);
     }
-    return sendAndStore(conv, 'text', text, (ws) => wa.sendText(env, db, ws, conv.wa_id, text));
+    return sendAndStore(conv, 'text', text, (n) => wa.sendText(env, db, n, conv.wa_id, text));
   }
 
   if ((p = m('POST', '/conversations/(\\d+)/template'))) {
@@ -391,19 +567,20 @@ async function route(request, env, ctx, db) {
     const params = Array.isArray(body.params) ? body.params.map((x) => str(x, 1000)) : [];
     if (!name) fail(400, 'টেমপ্লেট বাছাই করুন');
     const text = str(body.preview, 4096) || `[template: ${name}]`;
-    return sendAndStore(conv, 'template', text, (ws) => wa.sendTemplate(env, db, ws, conv.wa_id, name, language, params));
+    return sendAndStore(conv, 'template', text, (n) => wa.sendTemplate(env, db, n, conv.wa_id, name, language, params));
   }
 
-  if (m('GET', '/templates')) {
-    const list = await wa.listTemplates(env, db, await workspace());
+  if ((p = m('GET', '/conversations/(\\d+)/templates'))) {
+    const conv = await loadConversation(p[0]);
+    const list = await wa.listTemplates(env, db, await numberOf(conv));
     return json(list.filter((t) => t.status === 'APPROVED'));
   }
 
   if ((p = m('GET', '/media/([\\w.-]+)'))) {
     const msg = await db.first('SELECT conversation_id FROM messages WHERE media_id = ? AND workspace_id = ?', p[0], wsId);
     if (!msg) fail(404, 'পাওয়া যায়নি');
-    await loadConversation(msg.conversation_id);
-    const media = await wa.downloadMedia(env, db, await workspace(), p[0]);
+    const conv = await loadConversation(msg.conversation_id);
+    const media = await wa.downloadMedia(env, db, await numberOf(conv), p[0]);
     return new Response(media.body, {
       headers: { 'Content-Type': media.mimeType || 'application/octet-stream', 'Cache-Control': 'private, max-age=86400' },
     });
@@ -428,22 +605,26 @@ async function route(request, env, ctx, db) {
     return json({ ok: true });
   }
 
-  // ---------- Dashboard & activity ----------
+  // ---------- Dashboard & activity (limited to the numbers this user can see) ----------
   if (m('GET', '/stats')) {
     const dayStart = Number(url.searchParams.get('dayStart')) || Date.now() - 864e5;
-    const count = async (sql, ...params) => Object.values(await db.first(sql, wsId, ...params))[0];
+    const count = async (sql, ...params) => Object.values(await db.first(sql, ...params))[0];
+    const conv = `FROM conversations c WHERE c.workspace_id = ? AND ${scopeSql}`;
+    const msgs = `FROM messages m JOIN conversations c ON c.id = m.conversation_id WHERE c.workspace_id = ? AND ${scopeSql}`;
     return json({
-      open: await count("SELECT COUNT(*) FROM conversations WHERE workspace_id = ? AND status = 'open'"),
-      unassigned: await count("SELECT COUNT(*) FROM conversations WHERE workspace_id = ? AND status = 'open' AND assigned_to IS NULL"),
-      unread: await count('SELECT COALESCE(SUM(unread), 0) FROM conversations WHERE workspace_id = ?'),
-      contacts: await count('SELECT COUNT(*) FROM contacts WHERE workspace_id = ?'),
-      inbound_today: await count("SELECT COUNT(*) FROM messages WHERE workspace_id = ? AND direction = 'in' AND created_ms >= ?", dayStart),
-      outbound_today: await count("SELECT COUNT(*) FROM messages WHERE workspace_id = ? AND direction = 'out' AND created_ms >= ?", dayStart),
+      open: await count(`SELECT COUNT(*) ${conv} AND c.status = 'open'`, wsId, ...scopeParams),
+      unassigned: await count(`SELECT COUNT(*) ${conv} AND c.status = 'open' AND c.assigned_to IS NULL`, wsId, ...scopeParams),
+      unread: await count(`SELECT COALESCE(SUM(c.unread), 0) ${conv}`, wsId, ...scopeParams),
+      contacts: await count(`SELECT COUNT(DISTINCT c.contact_id) ${conv}`, wsId, ...scopeParams),
+      inbound_today: await count(`SELECT COUNT(*) ${msgs} AND m.direction = 'in' AND m.created_ms >= ?`, wsId, ...scopeParams, dayStart),
+      outbound_today: await count(`SELECT COUNT(*) ${msgs} AND m.direction = 'out' AND m.created_ms >= ?`, wsId, ...scopeParams, dayStart),
       per_agent: await db.all(`
         SELECT u.id, u.name, u.role,
-          (SELECT COUNT(*) FROM conversations c WHERE c.assigned_to = u.id AND c.status = 'open') AS open_chats,
-          (SELECT COUNT(*) FROM messages m WHERE m.sent_by = u.id AND m.created_ms >= ?) AS sent_today
-        FROM users u WHERE u.workspace_id = ? AND u.active = 1 ORDER BY sent_today DESC, u.name`, dayStart, wsId),
+          (SELECT COUNT(*) FROM conversations c WHERE c.assigned_to = u.id AND c.status = 'open' AND ${scopeSql}) AS open_chats,
+          (SELECT COUNT(*) FROM messages m JOIN conversations c ON c.id = m.conversation_id
+            WHERE m.sent_by = u.id AND m.created_ms >= ? AND ${scopeSql}) AS sent_today
+        FROM users u WHERE u.workspace_id = ? AND u.active = 1 ORDER BY sent_today DESC, u.name`,
+      ...scopeParams, dayStart, ...scopeParams, wsId),
     });
   }
 
@@ -488,7 +669,8 @@ async function route(request, env, ctx, db) {
     const waId = phoneDigits(body.phone);
     const text = str(body.text, 4096);
     if (waId.length < 8 || !text) fail(400, 'নাম্বার ও মেসেজ দিন');
-    const stored = await inbox.storeInbound(db, wsId, { waId, name: str(body.name, 120) || null, type: 'text', body: text });
+    const number = await loadNumber(body.number_id || user.numberIds[0] || 0);
+    const stored = await inbox.storeInbound(db, wsId, number.id, { waId, name: str(body.name, 120) || null, type: 'text', body: text });
     if (stored) {
       ctx.waitUntil(inbox.conversationView(db, stored.convId)
         .then((conv) => notifyInbound(db, conv, text, url.origin))

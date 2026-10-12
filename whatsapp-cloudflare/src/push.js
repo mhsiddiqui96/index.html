@@ -102,9 +102,11 @@ export async function notifyUser(db, userId, payload, origin) {
 // Notify every team member who turned on notifications and may see this chat (owners/admins: all chats).
 export async function notifyInbound(db, conv, text, origin) {
   const subs = await db.all(`
-    SELECT s.*, u.role FROM push_subscriptions s JOIN users u ON u.id = s.user_id
+    SELECT s.*, u.role,
+      (SELECT json_group_array(na.number_id) FROM number_access na WHERE na.user_id = u.id) AS number_ids
+    FROM push_subscriptions s JOIN users u ON u.id = s.user_id
     WHERE s.workspace_id = ? AND u.active = 1`, conv.workspace_id);
-  const targets = subs.filter((s) => canAccess({ id: s.user_id, role: s.role }, conv));
+  const targets = subs.filter((s) => canAccess({ id: s.user_id, role: s.role, numberIds: JSON.parse(s.number_ids || '[]') }, conv));
   if (!targets.length) return;
   const name = conv.contact_name || `+${conv.wa_id}`;
   const payload = {
@@ -113,6 +115,7 @@ export async function notifyInbound(db, conv, text, origin) {
     url: `/#/inbox/${conv.id}`,
     tag: `conv-${conv.id}`,
     unread: conv.unread,
+    number: conv.number_label,
   };
   await Promise.allSettled(targets.map((s) => sendOne(db, s, payload, subjectFor(origin))));
 }

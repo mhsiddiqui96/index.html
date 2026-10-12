@@ -8,6 +8,7 @@ export async function handleWebhook(request, env, ctx, db) {
   if (request.method === 'GET') {
     // Verification handshake when the webhook is saved in the Meta App Dashboard.
     const token = url.searchParams.get('hub.verify_token');
+    // One verify token per workspace; it is the same for all of the workspace's numbers.
     if (url.searchParams.get('hub.mode') === 'subscribe' && token &&
         await db.first('SELECT 1 FROM workspaces WHERE wa_verify_token = ?', token)) {
       return new Response(url.searchParams.get('hub.challenge') || '', { status: 200 });
@@ -48,24 +49,24 @@ function extractBody(msg) {
 }
 
 export async function processPayload(db, payload, raw, signature, origin) {
-  const checked = new Map(); // workspace id -> signature ok
+  const checked = new Map(); // number id -> signature ok (each number may belong to a different Meta app)
   for (const entry of payload.entry || []) {
     for (const change of entry.changes || []) {
       if (change.field !== 'messages') continue;
       const value = change.value || {};
       const phoneNumberId = value.metadata?.phone_number_id;
-      const ws = phoneNumberId && await db.first('SELECT id, wa_app_secret FROM workspaces WHERE wa_phone_number_id = ?', phoneNumberId);
-      if (!ws) { console.warn(`no workspace for phone_number_id ${phoneNumberId}`); continue; }
-      if (!checked.has(ws.id)) {
-        const secret = await decrypt(db, ws.wa_app_secret);
-        checked.set(ws.id, !secret || await verifyMetaSignature(raw, signature, secret));
+      const num = phoneNumberId && await db.first('SELECT id, workspace_id, wa_app_secret FROM numbers WHERE wa_phone_number_id = ?', phoneNumberId);
+      if (!num) { console.warn(`no number for phone_number_id ${phoneNumberId}`); continue; }
+      if (!checked.has(num.id)) {
+        const secret = await decrypt(db, num.wa_app_secret);
+        checked.set(num.id, !secret || await verifyMetaSignature(raw, signature, secret));
       }
-      if (!checked.get(ws.id)) { console.warn(`bad signature for workspace ${ws.id}`); continue; }
+      if (!checked.get(num.id)) { console.warn(`bad signature for number ${num.id}`); continue; }
 
       const names = Object.fromEntries((value.contacts || []).map((c) => [c.wa_id, c.profile?.name]));
       for (const msg of value.messages || []) {
         const { body, mediaId } = extractBody(msg);
-        const stored = await storeInbound(db, ws.id, {
+        const stored = await storeInbound(db, num.workspace_id, num.id, {
           waId: msg.from, name: names[msg.from], waMessageId: msg.id,
           type: msg.type, body, mediaId, timestampMs: Number(msg.timestamp) * 1000,
         });
@@ -76,7 +77,7 @@ export async function processPayload(db, payload, raw, signature, origin) {
       }
       for (const st of value.statuses || []) {
         const err = st.errors?.[0];
-        await updateStatus(db, ws.id, st.id, st.status, err ? `${err.code}: ${err.title || err.message}` : null);
+        await updateStatus(db, num.workspace_id, st.id, st.status, err ? `${err.code}: ${err.title || err.message}` : null);
       }
     }
   }
