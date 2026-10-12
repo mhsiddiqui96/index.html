@@ -87,7 +87,7 @@ const inbound = (id, text, from = '8801711111111') => ({ entry: [{ changes: [{ f
 test('static UI is served', async () => {
   const res = await fetch(base + '/');
   assert.equal(res.status, 200);
-  assert.match(await res.text(), /WA Business Desk/);
+  assert.match(await res.text(), /WA Business SaaS/);
   assert.equal(res.headers.get('x-frame-options'), 'DENY');
 });
 

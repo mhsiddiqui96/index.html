@@ -1,5 +1,5 @@
 'use strict';
-/* WA Business Desk — single-page admin panel (vanilla JS, no build step). */
+/* WA Business SaaS — single-page admin panel (vanilla JS, no build step). */
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -76,7 +76,7 @@ async function renderAuth(mode) {
   const signup = mode === 'signup';
   $('#app').innerHTML = `
   <div class="auth"><div class="auth-card">
-    <div class="brand"><div class="logo">✆</div> WA Business Desk</div>
+    <div class="brand"><div class="logo">✆</div> WA Business SaaS</div>
     <h1>${signup ? 'নতুন বিজনেস অ্যাকাউন্ট খুলুন' : 'লগইন করুন'}</h1>
     <div class="hint">${signup ? 'আপনি হবেন এই অ্যাকাউন্টের মালিক (Owner)। পরে টিমে অ্যাডমিন/এজেন্ট যোগ করতে পারবেন।' : 'আপনার টিমের WhatsApp ইনবক্সে প্রবেশ করুন'}</div>
     <form id="authForm">
@@ -153,7 +153,7 @@ function updateUnreadBadge() {
   const total = state.convs.reduce((a, c) => a + (c.unread || 0), 0);
   const b = $('#unreadBadge');
   if (b) { b.hidden = !total; b.textContent = total; }
-  document.title = (total ? `(${total}) ` : '') + 'WA Business Desk';
+  document.title = (total ? `(${total}) ` : '') + 'WA Business SaaS';
 }
 
 // ---------- live updates (polling; Workers have no shared push channel on the free plan) ----------

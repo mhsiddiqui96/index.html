@@ -1,9 +1,9 @@
-# Render Blueprint — WA Business Desk (whatsapp-saas/)
+# Render Blueprint — WA Business SaaS (whatsapp-saas/)
 # Render Dashboard → New → Blueprint → এই রিপো বাছাই করুন।
 # Persistent disk এর জন্য পেইড প্ল্যান (Starter) লাগে; ফ্রি প্ল্যানে রিস্টার্টে সব ডাটা মুছে যায়।
 services:
   - type: web
-    name: wa-business-desk
+    name: wa-business-saas
     runtime: docker
     dockerfilePath: ./whatsapp-saas/Dockerfile
     dockerContext: ./whatsapp-saas

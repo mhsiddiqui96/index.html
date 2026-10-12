@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "wa-business-desk",
+  "name": "wa-business-saas",
   "main": "src/index.js",
   "compatibility_date": "2025-09-01",
   "assets": {
@@ -12,8 +12,9 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "wa-business-desk-db",
-      "database_id": "00000000-0000-0000-0000-000000000000"
+      // No database_id: Wrangler creates the D1 database on the first deploy (and reuses it afterwards),
+      // whether deployed with the button, from the dashboard's Git connection, or by `wrangler deploy`.
+      "database_name": "wa-business-saas-db"
     }
   ],
   "vars": {

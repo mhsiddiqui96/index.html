@@ -1,4 +1,4 @@
-// WA Business Desk on Cloudflare Workers: API + Meta webhook; everything else is served from ./public.
+// WA Business SaaS on Cloudflare Workers: API + Meta webhook; everything else is served from ./public.
 import { ensureSchema, makeDb } from './db.js';
 import { handleApi } from './api.js';
 import { handleWebhook } from './webhook.js';
